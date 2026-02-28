@@ -26,10 +26,12 @@ pub const ParseError = error{
     InvalidPort,
     InvalidNumber,
     MissingValue,
+    InvalidSyntax,
     UnterminatedQuote,
     InvalidPortRange,
     InvalidLogLevel,
     InvalidBoolean,
+    UnknownDirective,
     OutOfMemory,
     ConfigFileTooLarge,
 };
@@ -108,6 +110,7 @@ pub const Directive = enum {
     max_spare_servers,
     min_spare_servers,
     start_servers,
+    max_requests_per_child,
 
     // Unknown directive (ignored with warning)
     unknown,
@@ -159,6 +162,7 @@ pub const Directive = enum {
             .{ "maxspareservers", .max_spare_servers },
             .{ "minspareservers", .min_spare_servers },
             .{ "startservers", .start_servers },
+            .{ "maxrequestsperchild", .max_requests_per_child },
         };
 
         // Case-insensitive comparison
@@ -243,12 +247,8 @@ fn parseLine(allocator: std.mem.Allocator, config: *Config, line: []const u8) !v
         },
         .listen => {
             const value = try parseValue(rest, false);
-            const duped = try allocator.dupe(u8, value);
-            if (config.listen_owned) {
-                allocator.free(@constCast(config.listen));
-            }
-            config.listen = duped;
-            config.listen_owned = true;
+            try validateIpLiteral(value);
+            config.addListenAddress(value) catch return error.OutOfMemory;
         },
         .timeout => {
             const value = try parseValue(rest, false);
@@ -326,11 +326,21 @@ fn parseLine(allocator: std.mem.Allocator, config: *Config, line: []const u8) !v
         },
         .allow => {
             const value = try parseValue(rest, false);
-            config.acl.allow(value) catch return error.OutOfMemory;
+            config.acl.allow(value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    std.log.warn("Ignoring invalid Allow rule: {s}", .{value});
+                },
+            };
         },
         .deny => {
             const value = try parseValue(rest, false);
-            config.acl.deny(value) catch return error.OutOfMemory;
+            config.acl.deny(value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    std.log.warn("Ignoring invalid Deny rule: {s}", .{value});
+                },
+            };
         },
         .basic_auth => {
             // Format: BasicAuth user password
@@ -392,9 +402,11 @@ fn parseLine(allocator: std.mem.Allocator, config: *Config, line: []const u8) !v
 
         // Reverse proxy
         .reverse_path => {
-            // Format: ReversePath "/api" "http://backend:8080/"
-            const parts = try parseTwoValues(rest);
-            config.reverse.addPath(parts.first, parts.second) catch return error.OutOfMemory;
+            // tinyproxy syntax: ReversePath "path" "url" OR ReversePath "url"
+            // Single-argument form maps "/" to the provided URL.
+            const parsed = try parseReversePath(rest);
+            const path = parsed.path orelse "/";
+            config.reverse.addPath(path, parsed.url) catch return error.OutOfMemory;
         },
 
         .add_header => {
@@ -449,12 +461,8 @@ fn parseLine(allocator: std.mem.Allocator, config: *Config, line: []const u8) !v
 
         .bind => {
             const value = try parseValue(rest, false);
-            const duped = try allocator.dupe(u8, value);
-            if (config.bind_addr_owned) {
-                if (config.bind_addr) |old| allocator.free(@constCast(old));
-            }
-            config.bind_addr = duped;
-            config.bind_addr_owned = true;
+            try validateIpLiteral(value);
+            config.addBindAddress(value) catch return error.OutOfMemory;
         },
 
         .bind_same => {
@@ -510,14 +518,14 @@ fn parseLine(allocator: std.mem.Allocator, config: *Config, line: []const u8) !v
 
         // Prefork directives - not supported in single-threaded coroutine model
         // These are ignored but should log a warning in production
-        .max_spare_servers, .min_spare_servers, .start_servers => {
+        .max_spare_servers, .min_spare_servers, .start_servers, .max_requests_per_child => {
             // Prefork directives not applicable to single-threaded coroutine model
-            // TODO: Consider logging a warning for user awareness
+            std.log.warn("Ignoring obsolete/prefork directive in single-threaded mode", .{});
         },
 
         .unknown => {
-            // Unknown directive - ignore with potential future warning
-            // tinyproxy behavior: ignore unknown directives
+            // tinyproxy C rejects unknown directives with a syntax error.
+            return error.UnknownDirective;
         },
     }
 }
@@ -567,7 +575,32 @@ fn parseTwoValues(rest: []const u8) !struct { first: []const u8, second: []const
 
     const first = try parseToken(&input);
     const second = try parseToken(&input);
-    return .{ .first = first, .second = second };
+    _ = parseToken(&input) catch |err| switch (err) {
+        error.MissingValue => return .{ .first = first, .second = second },
+        else => return err,
+    };
+    return error.InvalidSyntax;
+}
+
+fn parseReversePath(rest: []const u8) !struct { path: ?[]const u8, url: []const u8 } {
+    var input = std.mem.trim(u8, rest, " \t");
+    if (input.len == 0) return error.MissingValue;
+
+    const first = try parseToken(&input);
+    const second = parseToken(&input) catch |err| switch (err) {
+        error.MissingValue => null,
+        else => return err,
+    };
+
+    // Reject extra tokens so behavior matches strict config parsing.
+    _ = parseToken(&input) catch |err| switch (err) {
+        error.MissingValue => return if (second) |url|
+            .{ .path = first, .url = url }
+        else
+            .{ .path = null, .url = first },
+        else => return err,
+    };
+    return error.InvalidSyntax;
 }
 
 /// Parse log level string to enum
@@ -638,6 +671,14 @@ inline fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+fn validateIpLiteral(value: []const u8) !void {
+    _ = std.net.Address.parseIp4(value, 0) catch {
+        _ = std.net.Address.parseIp6(value, 0) catch return error.InvalidSyntax;
+        return;
+    };
+    return;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -656,7 +697,8 @@ test "parse basic config" {
     defer config.deinit();
 
     try std.testing.expectEqual(@as(u16, 8888), config.port);
-    try std.testing.expectEqualStrings("0.0.0.0", config.listen);
+    try std.testing.expectEqual(@as(usize, 1), config.listen_addrs.items.len);
+    try std.testing.expectEqualStrings("0.0.0.0", config.listen_addrs.items[0]);
     try std.testing.expectEqual(@as(u32, 120), config.idle_timeout);
     try std.testing.expectEqual(@as(usize, 50), config.max_clients);
 }
@@ -674,6 +716,41 @@ test "parse case insensitive directives" {
 
     // Last value wins
     try std.testing.expectEqual(@as(u16, 9002), config.port);
+}
+
+test "parse multiple listen directives preserves order" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\Listen 127.0.0.1
+        \\Listen ::1
+    ;
+
+    var config = try parseText(allocator, text);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), config.listen_addrs.items.len);
+    try std.testing.expectEqualStrings("127.0.0.1", config.listen_addrs.items[0]);
+    try std.testing.expectEqualStrings("::1", config.listen_addrs.items[1]);
+}
+
+test "parse invalid listen address fails" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidSyntax, parseText(allocator, "Listen not-an-ip"));
+}
+
+test "parse multiple bind directives preserves order" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\Bind 127.0.0.1
+        \\Bind ::1
+    ;
+
+    var config = try parseText(allocator, text);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), config.bind_addrs.items.len);
+    try std.testing.expectEqualStrings("127.0.0.1", config.bind_addrs.items[0]);
+    try std.testing.expectEqualStrings("::1", config.bind_addrs.items[1]);
 }
 
 test "parse quoted values" {
@@ -795,20 +872,20 @@ test "parse addheader directive" {
     try std.testing.expectEqualStrings("hello world", config.add_headers.items[1].value);
 }
 
-test "ignore unknown directives" {
+test "parse addheader rejects extra tokens" {
+    const allocator = std.testing.allocator;
+    const text = "AddHeader X-Test 123 extra";
+    try std.testing.expectError(error.InvalidSyntax, parseText(allocator, text));
+}
+
+test "unknown directives fail parsing" {
     const allocator = std.testing.allocator;
     const text =
         \\Port 8888
         \\UnknownDirective value
-        \\AnotherUnknown "quoted value"
-        \\Timeout 60
     ;
 
-    var config = try parseText(allocator, text);
-    defer config.deinit();
-
-    try std.testing.expectEqual(@as(u16, 8888), config.port);
-    try std.testing.expectEqual(@as(u32, 60), config.idle_timeout);
+    try std.testing.expectError(error.UnknownDirective, parseText(allocator, text));
 }
 
 test "skip comments and empty lines" {
@@ -850,6 +927,21 @@ test "parse acl rules" {
     try std.testing.expectEqual(AclAction.deny, config.acl.check(external));
 }
 
+test "invalid acl rules are ignored (tinyproxy-compatible)" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\Deny 0.0.0.0/0
+        \\Allow not-an-address
+    ;
+
+    var config = try parseText(allocator, text);
+    defer config.deinit();
+
+    const localhost = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    const AclAction = @import("acl.zig").AclAction;
+    try std.testing.expectEqual(AclAction.deny, config.acl.check(localhost));
+}
+
 test "parse basic auth" {
     const allocator = std.testing.allocator;
     const text =
@@ -875,6 +967,31 @@ test "parse basic auth" {
     try std.testing.expect(!config.auth.verify(null));
 }
 
+test "parse upstream none and auth upstream" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\Upstream socks5 user:pass@127.0.0.1:9050 ".onion"
+        \\Upstream none ".internal.example.com"
+        \\Upstream http 10.0.0.1:3128
+    ;
+
+    var config = try parseText(allocator, text);
+    defer config.deinit();
+
+    const onion = config.upstream.findUpstream("hidden.onion");
+    try std.testing.expect(onion != null);
+    try std.testing.expectEqualStrings("127.0.0.1", onion.?.host);
+    try std.testing.expectEqualStrings("user", onion.?.user.?);
+    try std.testing.expectEqualStrings("pass", onion.?.pass.?);
+
+    const internal = config.upstream.findUpstream("svc.internal.example.com");
+    try std.testing.expect(internal == null);
+
+    const internet = config.upstream.findUpstream("example.org");
+    try std.testing.expect(internet != null);
+    try std.testing.expectEqualStrings("10.0.0.1", internet.?.host);
+}
+
 test "reload config applies new values" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -896,7 +1013,8 @@ test "reload config applies new values" {
     try std.testing.expectEqual(@as(u16, 9999), config.port);
     try reloadConfig(&config, path);
     try std.testing.expectEqual(@as(u16, 8888), config.port);
-    try std.testing.expectEqualStrings("0.0.0.0", config.listen);
+    try std.testing.expectEqual(@as(usize, 1), config.listen_addrs.items.len);
+    try std.testing.expectEqualStrings("0.0.0.0", config.listen_addrs.items[0]);
 }
 
 test "reload config keeps previous values on error" {
@@ -963,4 +1081,16 @@ test "parse reverse magic directive" {
         defer config.deinit();
         try std.testing.expect(!config.reverse.reverse_magic);
     }
+}
+
+test "parse reversepath single-argument form" {
+    const allocator = std.testing.allocator;
+    const text = "ReversePath \"http://backend:8080/\"";
+
+    var config = try parseText(allocator, text);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.reverse.paths.items.len);
+    try std.testing.expectEqualStrings("/", config.reverse.paths.items[0].path);
+    try std.testing.expectEqualStrings("http://backend:8080/", config.reverse.paths.items[0].url);
 }

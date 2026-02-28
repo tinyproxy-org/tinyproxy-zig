@@ -180,6 +180,7 @@ pub fn read_headers(
 ) !HttpMessage {
     var message = HttpMessage.init(allocator);
     errdefer message.deinit();
+    var last_header_index: ?usize = null;
 
     while (true) {
         const line = try reader.readLine(rt, stream);
@@ -187,10 +188,30 @@ pub fn read_headers(
         const trimmed = std.mem.trimRight(u8, line, "\r\n");
         if (trimmed.len == 0) break;
 
-        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.InvalidHeader;
+        // RFC 7230 obsolete line folding support (C tinyproxy-compatible).
+        if (trimmed[0] == ' ' or trimmed[0] == '\t') {
+            if (last_header_index) |idx| {
+                const old_value = message.header_list.items[idx].value;
+                const combined = try std.fmt.allocPrint(allocator, "{s}\r\n{s}", .{ old_value, trimmed });
+                allocator.free(old_value);
+                message.header_list.items[idx].value = combined;
+                const header_name = message.header_list.items[idx].name;
+                try message.headers.put(header_name, combined);
+            }
+            continue;
+        }
+
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse {
+            // tinyproxy C behavior: skip malformed header lines without ':'.
+            last_header_index = null;
+            continue;
+        };
         const name_raw = std.mem.trim(u8, trimmed[0..colon], " \t");
         const value_raw = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
-        if (name_raw.len == 0) return error.InvalidHeader;
+        if (name_raw.len == 0) {
+            last_header_index = null;
+            continue;
+        }
 
         const name = try allocator.dupe(u8, name_raw);
         for (name) |*c| c.* = std.ascii.toLower(c.*);
@@ -205,6 +226,7 @@ pub fn read_headers(
 
         try message.header_list.append(allocator, .{ .name = name, .value = value });
         try message.headers.put(name, value);
+        last_header_index = message.header_list.items.len - 1;
 
         if (std.mem.eql(u8, name, "content-length")) {
             message.content_length = std.fmt.parseInt(usize, value_raw, 10) catch return error.InvalidContentLength;
@@ -229,6 +251,53 @@ test "parse request line http11" {
     try std.testing.expectEqualStrings("GET", req.method);
     try std.testing.expectEqualStrings("/path", req.uri);
     try std.testing.expect(req.version == .http11);
+}
+
+fn malformed_header_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
+    var stream = try server.accept();
+    defer stream.close();
+
+    var reader = buffer.LineReader.init(rt.allocator, buffer.MAX_LINE_LENGTH);
+    defer reader.deinit();
+
+    const line = try reader.readLine(rt, &stream);
+    defer rt.allocator.free(line);
+    _ = try parse_request_line(line);
+
+    var message = try read_headers(rt.allocator, &reader, rt, &stream);
+    defer message.deinit();
+
+    try std.testing.expectEqualStrings("example.com", message.headers.get("host").?);
+    try std.testing.expect(message.headers.get("bad-header-without-colon") == null);
+    try std.testing.expectEqualStrings("one\r\n continuation", message.headers.get("x-test").?);
+}
+
+test "read headers skips malformed lines and supports folded continuation" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18086);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.close();
+
+    var server_task = try rt.spawn(malformed_header_server, .{ rt, &server });
+
+    var client = try addr.connect(.{});
+    defer client.close();
+
+    try client.writeAll(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "Bad Header Without Colon\r\n" ++
+            "X-Test: one\r\n" ++
+            " continuation\r\n" ++
+            "\r\n",
+        .none,
+    );
+
+    try server_task.join();
 }
 
 const TestWriter = struct {

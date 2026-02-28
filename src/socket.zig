@@ -23,19 +23,54 @@ pub fn connectWithBind(
     var socket = try zio.net.Socket.open(.stream, .fromPosix(target_addr.any.family), .ip);
     errdefer socket.close();
 
-    // Parse and bind to local address (port 0 = OS assigns ephemeral port)
-    if (zio.net.IpAddress.parseIp(bind_ip, 0)) |local_addr| {
-        socket.bind(.{ .ip = local_addr }) catch |err| {
-            log.warn("Failed to bind to '{s}': {}, connecting without bind", .{ bind_ip, err });
-        };
-    } else |_| {
-        log.warn("Failed to parse bind address '{s}', connecting without bind", .{bind_ip});
-    }
+    // Parse and bind to local address (port 0 = OS assigns ephemeral port).
+    // tinyproxy behavior: when bind address is explicitly requested, bind failure
+    // aborts this connection attempt.
+    const local_addr = try zio.net.IpAddress.parseIp(bind_ip, 0);
+    try socket.bind(.{ .ip = local_addr });
 
     // Async connect via zio event loop — yields to other coroutines while waiting
     try socket.connect(.{ .ip = target_addr }, .{});
 
     return .{ .socket = socket };
+}
+
+/// Connect to target trying each bind address until one succeeds.
+/// Returns an error if none can be used.
+pub fn connectWithBindList(
+    _: *zio.Runtime,
+    target_addr: zio.net.IpAddress,
+    bind_addrs: []const []const u8,
+) !zio.net.Stream {
+    if (bind_addrs.len == 0) return target_addr.connect(.{});
+
+    var last_err: ?anyerror = null;
+    for (bind_addrs) |bind_ip| {
+        var socket = try zio.net.Socket.open(.stream, .fromPosix(target_addr.any.family), .ip);
+        errdefer socket.close();
+
+        const local_addr = zio.net.IpAddress.parseIp(bind_ip, 0) catch |err| {
+            last_err = err;
+            continue;
+        };
+
+        socket.bind(.{ .ip = local_addr }) catch |err| {
+            last_err = err;
+            continue;
+        };
+
+        socket.connect(.{ .ip = target_addr }, .{}) catch |err| {
+            last_err = err;
+            continue;
+        };
+        return .{ .socket = socket };
+    }
+
+    if (last_err) |err| {
+        log.warn("Failed to bind/connect using configured bind addresses: {}", .{err});
+        return err;
+    }
+    return error.AddressNotAvailable;
 }
 
 /// get peer (remote) address from the socket
@@ -98,4 +133,3 @@ pub fn set_socket_blocking(sock: posix.socket_t) !void {
 
     _ = try posix.fcntl(sock, posix.F.SETFL, new_flags);
 }
-

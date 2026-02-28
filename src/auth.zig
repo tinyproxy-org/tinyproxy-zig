@@ -240,6 +240,19 @@ pub fn build407Response(realm: []const u8, buf: []u8) ![]u8 {
     , .{realm});
 }
 
+/// Build a 401 Unauthorized response
+pub fn build401Response(realm: []const u8, buf: []u8) ![]u8 {
+    return std.fmt.bufPrint(buf,
+        \\HTTP/1.1 401 Unauthorized
+        \\WWW-Authenticate: Basic realm="{s}"
+        \\Content-Type: text/html
+        \\Content-Length: 42
+        \\Connection: close
+        \\
+        \\<html><body>Authentication required</body>
+    , .{realm});
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -306,6 +319,14 @@ test "build 407 response" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "407 Proxy Authentication Required") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "realm=\"tinyproxy\"") != null);
+}
+
+test "build 401 response" {
+    var buf: [512]u8 = undefined;
+    const response = try build401Response("tinyproxy", &buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "401 Unauthorized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "WWW-Authenticate: Basic realm=\"tinyproxy\"") != null);
 }
 
 test "BasicAuth hasCredentials" {

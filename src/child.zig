@@ -16,15 +16,51 @@ const log = std.log.scoped(.@"tinyproxy/child");
 const ERROR_403_DENIED = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nAccess denied by ACL";
 const ERROR_503_BUSY = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nProxy at max clients";
 
-var server: zio.net.Server = undefined;
+var listen_servers: std.ArrayList(zio.net.Server) = .empty;
+var listen_servers_allocator: ?std.mem.Allocator = null;
 
 /// Active connection counter (atomic for thread safety)
 var active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 pub fn listen_socket(_: *zio.Runtime, config: *Config) !void {
-    const ip = try zio.net.IpAddress.parseIp(config.listen, config.port);
-    server = try ip.listen(.{ .kernel_backlog = 1024, .reuse_address = true });
-    log.info("listening on {s}:{d}", .{ config.listen, config.port });
+    // Reset previous listeners if needed (defensive in tests/restarts).
+    close_listen_sockets();
+    listen_servers_allocator = config.allocator;
+    errdefer {
+        close_listen_sockets();
+    }
+
+    if (config.listen_addrs.items.len == 0) {
+        // tinyproxy behavior: no Listen directive => wildcard listen.
+        var bound_any = false;
+        const any_v4 = zio.net.IpAddress.parseIp("0.0.0.0", config.port) catch unreachable;
+        if (any_v4.listen(.{ .kernel_backlog = 1024, .reuse_address = true })) |server| {
+            try listen_servers.append(config.allocator, server);
+            bound_any = true;
+            log.info("listening on 0.0.0.0:{d}", .{config.port});
+        } else |err| {
+            log.warn("Failed to listen on 0.0.0.0:{d}: {}", .{ config.port, err });
+        }
+
+        const any_v6 = zio.net.IpAddress.parseIp("::", config.port) catch unreachable;
+        if (any_v6.listen(.{ .kernel_backlog = 1024, .reuse_address = true })) |server| {
+            try listen_servers.append(config.allocator, server);
+            bound_any = true;
+            log.info("listening on [::]:{d}", .{config.port});
+        } else |err| {
+            log.warn("Failed to listen on [::]:{d}: {}", .{ config.port, err });
+        }
+
+        if (!bound_any) return error.AddressNotAvailable;
+    } else {
+        for (config.listen_addrs.items) |listen_addr| {
+            const ip = try zio.net.IpAddress.parseIp(listen_addr, config.port);
+            const server = try ip.listen(.{ .kernel_backlog = 1024, .reuse_address = true });
+            try listen_servers.append(config.allocator, server);
+            log.info("listening on {s}:{d}", .{ listen_addr, config.port });
+        }
+    }
 
     // Drop privileges after binding (allows binding to privileged ports as root)
     if (config.user != null or config.group != null) {
@@ -38,59 +74,105 @@ pub fn listen_socket(_: *zio.Runtime, config: *Config) !void {
     }
 }
 
-/// Accept a connection via zio's event loop (used as a spawned task for select).
-fn doAccept() !zio.net.Stream {
-    return server.accept();
-}
-
-/// Watch for SIGHUP and log reload requests.
-/// Installing a zio.Signal handler prevents the default terminate action.
-fn reloadWatcher() void {
-    var sig = zio.Signal.init(.hangup) catch return;
-    defer sig.deinit();
-    while (true) {
-        sig.wait() catch return;
-        log.info("Configuration reload requested (SIGHUP) — not yet implemented", .{});
+pub fn close_listen_sockets() void {
+    for (listen_servers.items) |server| {
+        server.close();
+    }
+    if (listen_servers_allocator) |alloc| {
+        listen_servers.deinit(alloc);
+        listen_servers = .empty;
+        listen_servers_allocator = null;
     }
 }
 
-/// Watch for SIGUSR1 and log rotation requests.
-fn logRotateWatcher() void {
-    var sig = zio.Signal.init(.user1) catch return;
-    defer sig.deinit();
-    while (true) {
-        sig.wait() catch return;
-        log.info("Log rotation requested (SIGUSR1) — not yet implemented", .{});
+fn reloadConfigAndLogging(config: *Config, config_path: []const u8) void {
+    if (config_path.len == 0) {
+        log.warn("SIGHUP received but no config file path is configured", .{});
+        return;
     }
+
+    conf_parser.reloadConfig(config, config_path) catch |err| {
+        log.err("Config reload failed for '{s}': {}", .{ config_path, err });
+        return;
+    };
+
+    // Match tinyproxy behavior: reload also reopens/reconfigures logging backend.
+    logger.deinit();
+    logger.init(config) catch |err| {
+        log.err("Logger reinit failed after config reload: {}", .{err});
+        return;
+    };
+
+    log.info("Configuration reloaded from '{s}'", .{config_path});
+}
+
+fn rotateLogFile(config: *const Config) void {
+    if (config.use_syslog) {
+        // No file descriptor to reopen when syslog backend is active.
+        log.info("SIGUSR1 received, ignoring reopen because syslog is enabled", .{});
+        return;
+    }
+
+    const path = config.log_file orelse {
+        log.info("SIGUSR1 received, but no log file configured", .{});
+        return;
+    };
+
+    logger.reopen(path) catch |err| {
+        log.err("Failed to reopen log file '{s}': {}", .{ path, err });
+        return;
+    };
+
+    log.info("Log file reopened: '{s}'", .{path});
 }
 
 pub fn main_loop(rt: *zio.Runtime, config: *Config, config_path: []const u8) !void {
-    _ = config_path; // Unused for now (needed for config reload support)
     log.info("main_loop: starting main loop", .{});
+    if (listen_servers.items.len == 0) return error.NotListening;
+    shutting_down.store(false, .release);
 
-    // Auxiliary signal watchers (prevent default termination for SIGHUP/SIGUSR1)
-    var reload_handle = try rt.spawn(reloadWatcher, .{});
-    var logrotate_handle = try rt.spawn(logRotateWatcher, .{});
+    var accept_handles = std.ArrayList(zio.JoinHandle(void)).empty;
     defer {
-        reload_handle.cancel();
-        logrotate_handle.cancel();
+        for (accept_handles.items) |*handle| {
+            handle.cancel();
+            _ = handle.join();
+        }
+        accept_handles.deinit(rt.allocator);
+        close_listen_sockets();
+    }
+    for (listen_servers.items) |server| {
+        const handle = try rt.spawn(acceptLoop, .{ rt, server, config });
+        try accept_handles.append(rt.allocator, handle);
     }
 
-    // Shutdown signals — used in select to race against accept
+    // Process signals in the main select loop.
     var sig_term = try zio.Signal.init(.terminate);
     defer sig_term.deinit();
     var sig_int = try zio.Signal.init(.interrupt);
     defer sig_int.deinit();
+    var sig_hup = try zio.Signal.init(.hangup);
+    defer sig_hup.deinit();
+    var sig_usr1 = try zio.Signal.init(.user1);
+    defer sig_usr1.deinit();
+
+    // Safe reload policy:
+    // active connection handlers receive a shared *Config. We defer deinit+swap
+    // until there are no active handlers to avoid use-after-free.
+    var reload_pending: bool = false;
+    var tick: zio.Timeout = .{ .duration = .fromMilliseconds(200) };
 
     while (true) {
-        // Spawn accept as a task so we can race it against shutdown signals
-        var accept_handle = try rt.spawn(doAccept, .{});
-        defer accept_handle.cancel();
+        if (reload_pending and active_connections.load(.acquire) == 0) {
+            reload_pending = false;
+            reloadConfigAndLogging(config, config_path);
+        }
 
         const result = zio.select(.{
-            .conn = &accept_handle,
             .term = &sig_term,
             .int = &sig_int,
+            .hup = &sig_hup,
+            .usr1 = &sig_usr1,
+            .tick = &tick,
         }) catch {
             log.info("Main loop interrupted, exiting...", .{});
             break;
@@ -101,58 +183,22 @@ pub fn main_loop(rt: *zio.Runtime, config: *Config, config_path: []const u8) !vo
                 log.info("Shutdown requested, exiting...", .{});
                 break;
             },
-            .conn => |accept_result| {
-                const stream = accept_result catch |err| {
-                    log.err("accept failed: {}", .{err});
-                    continue;
-                };
-
-                stats.global.recordOpen();
-
-                // Check MaxClients limit
-                const current_connections = active_connections.load(.acquire);
-                if (current_connections >= config.max_clients) {
-                    log.info("MaxClients ({d}) reached, rejecting connection", .{config.max_clients});
-                    stats.global.recordRefused();
-                    stream.writeAll(ERROR_503_BUSY, .none) catch {};
-                    stream.close();
-                    stats.global.recordClose();
-                    continue;
+            .hup => {
+                if (active_connections.load(.acquire) == 0) {
+                    reloadConfigAndLogging(config, config_path);
+                } else {
+                    reload_pending = true;
+                    log.info("SIGHUP received, deferring reload until active connections drain", .{});
                 }
-
-                // Check ACL if rules are configured
-                if (config.acl.hasRules()) {
-                    const client_addr = stream.socket.address.toStd();
-
-                    const action = config.acl.check(client_addr);
-                    if (action == .deny) {
-                        log.info("Connection denied by ACL from {f}", .{stream.socket.address.ip});
-                        stats.global.recordRefused();
-                        stream.writeAll(ERROR_403_DENIED, .none) catch {};
-                        stream.close();
-                        stats.global.recordClose();
-                        continue;
-                    }
-                }
-
-                // Set socket timeout for idle connections
-                if (config.idle_timeout > 0) {
-                    socket.set_socket_timeout(stream.socket.handle, config.idle_timeout) catch |err| {
-                        log.warn("Failed to set socket timeout: {}", .{err});
-                    };
-                }
-
-                // Increment active connections
-                _ = active_connections.fetchAdd(1, .monotonic);
-
-                // Spawn connection handler
-                _ = try rt.spawn(handleConnectionWithCounter, .{ rt, stream, config });
-
-                // Yield to allow the handler task to start
-                try rt.yield();
             },
+            .usr1 => {
+                rotateLogFile(config);
+            },
+            .tick => {},
         }
     }
+    shutting_down.store(true, .release);
+    close_listen_sockets();
 
     // Wait briefly for active connection handlers to drain (max 2s)
     {
@@ -169,6 +215,65 @@ pub fn main_loop(rt: *zio.Runtime, config: *Config, config_path: []const u8) !vo
     log.info("Main loop exited", .{});
 }
 
+fn acceptLoop(rt: *zio.Runtime, server: zio.net.Server, config: *Config) void {
+    while (!shutting_down.load(.acquire)) {
+        const stream = server.accept() catch |err| {
+            if (shutting_down.load(.acquire)) break;
+            log.err("accept failed on {f}: {}", .{ server.socket.address, err });
+            continue;
+        };
+        handleAcceptedConnection(rt, stream, config);
+    }
+}
+
+fn handleAcceptedConnection(rt: *zio.Runtime, stream: zio.net.Stream, config: *Config) void {
+    stats.global.recordOpen();
+
+    // Check MaxClients limit
+    const current_connections = active_connections.load(.acquire);
+    if (current_connections >= config.max_clients) {
+        log.info("MaxClients ({d}) reached, rejecting connection", .{config.max_clients});
+        stats.global.recordRefused();
+        stream.writeAll(ERROR_503_BUSY, .none) catch {};
+        stream.close();
+        stats.global.recordClose();
+        return;
+    }
+
+    // Check ACL if rules are configured
+    if (config.acl.hasRules()) {
+        const client_addr = stream.socket.address.toStd();
+        const action = config.acl.check(client_addr);
+        if (action == .deny) {
+            log.info("Connection denied by ACL from {f}", .{stream.socket.address.ip});
+            stats.global.recordRefused();
+            stream.writeAll(ERROR_403_DENIED, .none) catch {};
+            stream.close();
+            stats.global.recordClose();
+            return;
+        }
+    }
+
+    // Set socket timeout for idle connections
+    if (config.idle_timeout > 0) {
+        socket.set_socket_timeout(stream.socket.handle, config.idle_timeout) catch |err| {
+            log.warn("Failed to set socket timeout: {}", .{err});
+        };
+    }
+
+    // Increment active connections before handing over ownership to handler.
+    _ = active_connections.fetchAdd(1, .monotonic);
+
+    _ = rt.spawn(handleConnectionWithCounter, .{ rt, stream, config }) catch |err| {
+        _ = active_connections.fetchSub(1, .monotonic);
+        stats.global.recordClose();
+        stream.close();
+        log.err("Failed to spawn connection handler: {}", .{err});
+        return;
+    };
+    rt.yield() catch {};
+}
+
 /// Wrapper that handles connection and decrements counter on completion
 fn handleConnectionWithCounter(rt: *zio.Runtime, stream: zio.net.Stream, config: *const Config) void {
     defer {
@@ -181,7 +286,8 @@ fn handleConnectionWithCounter(rt: *zio.Runtime, stream: zio.net.Stream, config:
 }
 
 pub fn accept_once(_: *zio.Runtime) !void {
-    const stream = try server.accept();
+    if (listen_servers.items.len == 0) return error.NotListening;
+    const stream = try listen_servers.items[0].accept();
     stream.close();
 }
 
@@ -194,13 +300,14 @@ test "accepts one connection" {
     var ready = zio.ResetEvent.init;
 
     var test_config = Config.init(gpa.allocator());
-    test_config.listen = "127.0.0.1";
+    try test_config.addListenAddress("127.0.0.1");
     test_config.port = 18080;
     defer test_config.deinit();
 
     var server_task = try rt.spawn(struct {
         fn run(rt2: *zio.Runtime, ready2: *zio.ResetEvent, config: *Config) !void {
             try listen_socket(rt2, config);
+            defer close_listen_sockets();
             ready2.set();
             try accept_once(rt2);
         }

@@ -132,6 +132,7 @@ fn main_task(rt: *zio.Runtime, conf: *Config, config_path: []const u8) !void {
     const log_main = std.log.scoped(.main_task);
     log_main.info("starting", .{});
     try child.listen_socket(rt, conf);
+    defer child.close_listen_sockets();
     log_main.info("listen_socket returned, calling main_loop", .{});
     try child.main_loop(rt, conf, config_path);
     log_main.info("main_loop returned", .{});

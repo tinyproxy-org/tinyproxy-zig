@@ -146,19 +146,63 @@ fn appendAddHeaders(message: *http.HttpMessage, config: *const Config) !void {
     }
 }
 
-/// Check authentication and send 407 if required
+const AuthChallenge = enum {
+    proxy_407,
+    origin_401,
+};
+
+const AuthSelection = struct {
+    header: ?[]const u8,
+    challenge: AuthChallenge,
+};
+
+fn selectAuthHeader(config: *const Config, message: *const http.HttpMessage) AuthSelection {
+    const proxy_auth = message.headers.get("proxy-authorization");
+    if (proxy_auth != null) {
+        // tinyproxy C: if Proxy-Authorization is present, use it directly even
+        // for StatHost requests. Missing/invalid proxy auth yields 407.
+        return .{
+            .header = proxy_auth,
+            .challenge = .proxy_407,
+        };
+    }
+
+    if (config.stat_host) |stat_host| {
+        if (message.headers.get("host")) |host| {
+            // tinyproxy C uses strncmp(host, stathost, strlen(stathost)).
+            if (std.mem.startsWith(u8, host, stat_host)) {
+                return .{
+                    .header = message.headers.get("authorization"),
+                    .challenge = .origin_401,
+                };
+            }
+        }
+    }
+
+    return .{
+        .header = null,
+        .challenge = .proxy_407,
+    };
+}
+
+/// Check authentication and send 401/407 based on tinyproxy semantics.
 fn checkAuthentication(stream: *zio.net.Stream, config: *const Config, message: *const http.HttpMessage) !bool {
     if (!config.auth.hasCredentials()) return true;
 
-    const auth_header = message.headers.get("proxy-authorization");
-    if (config.auth.verify(auth_header)) return true;
+    const selected = selectAuthHeader(config, message);
+    if (config.auth.verify(selected.header)) return true;
 
-    // Send 407 Proxy Authentication Required
     const auth_mod = @import("auth.zig");
     var response_buf: [512]u8 = undefined;
-    const response = auth_mod.build407Response(config.auth.realm, &response_buf) catch {
-        try stream.writeAll("HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\n\r\n", .none);
-        return false;
+    const response = switch (selected.challenge) {
+        .proxy_407 => auth_mod.build407Response(config.auth.realm, &response_buf) catch {
+            try stream.writeAll("HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\n\r\n", .none);
+            return false;
+        },
+        .origin_401 => auth_mod.build401Response(config.auth.realm, &response_buf) catch {
+            try stream.writeAll("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n", .none);
+            return false;
+        },
     };
     try stream.writeAll(response, .none);
     return false;
@@ -267,7 +311,10 @@ fn establishProxyTunnel(
 ) !void {
     switch (proxy.proxy_type) {
         .http => {
-            const connect_cmd = try std.fmt.allocPrint(rt.allocator, "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n\r\n", .{ req.host, req.port, req.host, req.port });
+            const connect_cmd = if (proxy.auth_basic) |auth|
+                try std.fmt.allocPrint(rt.allocator, "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\nProxy-Authorization: Basic {s}\r\n\r\n", .{ req.host, req.port, req.host, req.port, auth })
+            else
+                try std.fmt.allocPrint(rt.allocator, "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n\r\n", .{ req.host, req.port, req.host, req.port });
             defer rt.allocator.free(connect_cmd);
             try upstream.writeAll(connect_cmd, .none);
 
@@ -333,6 +380,11 @@ fn handleHttpRequest(
     try upstream.writeAll(request_line, .none);
     try writeHostHeader(rt, &upstream, req);
     try upstream.writeAll("Connection: close\r\n", .none);
+    if (conn_res.proxy) |p| {
+        if (p.proxy_type == .http) {
+            try writeHttpProxyAuthHeader(&upstream, p);
+        }
+    }
 
     // Add X-Tinyproxy header with client IP if enabled
     if (config.xtinyproxy) {
@@ -395,6 +447,13 @@ fn writeXTinyproxyHeader(upstream: *zio.net.Stream, stream: zio.net.Stream) !voi
         try upstream.writeAll(ip_str, .none);
         try upstream.writeAll("\r\n", .none);
     }
+}
+
+fn writeHttpProxyAuthHeader(upstream: *zio.net.Stream, proxy: *const upstream_mod.UpstreamProxy) !void {
+    const auth = proxy.auth_basic orelse return;
+    try upstream.writeAll("Proxy-Authorization: Basic ", .none);
+    try upstream.writeAll(auth, .none);
+    try upstream.writeAll("\r\n", .none);
 }
 
 /// Handle an incoming client connection
@@ -809,6 +868,62 @@ test "append addheader entries to message" {
     try std.testing.expectEqualStrings("123", message.header_list.items[1].value);
 }
 
+fn putHeaderForTest(message: *http.HttpMessage, allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    const name_duped = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_duped);
+    const value_duped = try allocator.dupe(u8, value);
+    errdefer allocator.free(value_duped);
+    try message.header_list.append(allocator, .{ .name = name_duped, .value = value_duped });
+    try message.headers.put(name_duped, value_duped);
+}
+
+test "selectAuthHeader uses proxy authorization by default" {
+    const allocator = std.testing.allocator;
+    var config = Config.init(allocator);
+    defer config.deinit();
+
+    var message = http.HttpMessage.init(allocator);
+    defer message.deinit();
+    try putHeaderForTest(&message, allocator, "proxy-authorization", "Basic abc");
+
+    const selected = selectAuthHeader(&config, &message);
+    try std.testing.expect(selected.challenge == .proxy_407);
+    try std.testing.expectEqualStrings("Basic abc", selected.header.?);
+}
+
+test "selectAuthHeader uses authorization for stat host when proxy header missing" {
+    const allocator = std.testing.allocator;
+    var config = Config.init(allocator);
+    defer config.deinit();
+    config.stat_host = "stats.local";
+
+    var message = http.HttpMessage.init(allocator);
+    defer message.deinit();
+    try putHeaderForTest(&message, allocator, "host", "stats.local:9999");
+    try putHeaderForTest(&message, allocator, "authorization", "Basic xyz");
+
+    const selected = selectAuthHeader(&config, &message);
+    try std.testing.expect(selected.challenge == .origin_401);
+    try std.testing.expectEqualStrings("Basic xyz", selected.header.?);
+}
+
+test "selectAuthHeader keeps proxy challenge when proxy header exists on stat host" {
+    const allocator = std.testing.allocator;
+    var config = Config.init(allocator);
+    defer config.deinit();
+    config.stat_host = "stats.local";
+
+    var message = http.HttpMessage.init(allocator);
+    defer message.deinit();
+    try putHeaderForTest(&message, allocator, "host", "stats.local");
+    try putHeaderForTest(&message, allocator, "proxy-authorization", "Basic bad");
+    try putHeaderForTest(&message, allocator, "authorization", "Basic good");
+
+    const selected = selectAuthHeader(&config, &message);
+    try std.testing.expect(selected.challenge == .proxy_407);
+    try std.testing.expectEqualStrings("Basic bad", selected.header.?);
+}
+
 fn connectTarget(rt: *zio.Runtime, req: *const Request, config: *const Config, client_socket: std.posix.socket_t) !struct { stream: zio.net.Stream, proxy: ?*const upstream_mod.UpstreamProxy } {
     const proxy = if (config.upstream_initialized) config.upstream.findUpstream(req.host) else null;
 
@@ -823,14 +938,13 @@ fn connectTarget(rt: *zio.Runtime, req: *const Request, config: *const Config, c
         break :blk zio.net.IpAddress.fromStd(list.addrs[0]);
     };
 
-    // Determine bind address: BindSame takes precedence over Bind
+    // Determine bind behavior: BindSame takes precedence over Bind directives.
     var local_addr_buf: [64]u8 = undefined;
-    const bind_addr: ?[]const u8 = if (config.bind_same)
-        socket.get_local_addr_str(client_socket, &local_addr_buf)
+    const stream = if (config.bind_same)
+        try socket.connectWithBind(rt, addr, socket.get_local_addr_str(client_socket, &local_addr_buf) orelse return error.AddressNotAvailable)
+    else if (config.bind_addrs.items.len > 0)
+        try socket.connectWithBindList(rt, addr, config.bind_addrs.items)
     else
-        config.bind_addr;
-
-    // Connect with optional local address binding
-    const stream = try socket.connectWithBind(rt, addr, bind_addr);
+        try socket.connectWithBind(rt, addr, null);
     return .{ .stream = stream, .proxy = proxy };
 }

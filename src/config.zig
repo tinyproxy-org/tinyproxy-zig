@@ -47,12 +47,13 @@ pub const Config = struct {
     // ========================================================================
     // Network Configuration
     // ========================================================================
-    listen: []const u8 = "127.0.0.1",
-    listen_owned: bool = false,
+    /// Incoming listen addresses (empty = wildcard listen)
+    listen_addrs: std.ArrayList([]const u8) = undefined,
+    listen_addrs_initialized: bool = false,
     port: u16 = 9999,
-    /// Local address to bind outgoing connections to
-    bind_addr: ?[]const u8 = null,
-    bind_addr_owned: bool = false,
+    /// Local addresses to bind outgoing connections to
+    bind_addrs: std.ArrayList([]const u8) = undefined,
+    bind_addrs_initialized: bool = false,
     /// Bind outgoing connections to same interface as incoming
     bind_same: bool = false,
 
@@ -178,6 +179,10 @@ pub const Config = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
+            .listen_addrs = std.ArrayList([]const u8).empty,
+            .listen_addrs_initialized = true,
+            .bind_addrs = std.ArrayList([]const u8).empty,
+            .bind_addrs_initialized = true,
             .anonymous_headers = std.StringHashMap(void).init(allocator),
             .anonymous_headers_initialized = true,
             .connect_ports = std.ArrayList(PortRange).empty,
@@ -201,13 +206,20 @@ pub const Config = struct {
 
     /// Deinitialize and free resources
     pub fn deinit(self: *Self) void {
+        // Free listen/bind address lists.
+        if (self.listen_addrs_initialized) {
+            for (self.listen_addrs.items) |addr| {
+                self.allocator.free(@constCast(addr));
+            }
+            self.listen_addrs.deinit(self.allocator);
+        }
+        if (self.bind_addrs_initialized) {
+            for (self.bind_addrs.items) |addr| {
+                self.allocator.free(@constCast(addr));
+            }
+            self.bind_addrs.deinit(self.allocator);
+        }
         // Free owned strings
-        if (self.listen_owned) {
-            self.allocator.free(@constCast(self.listen));
-        }
-        if (self.bind_addr_owned) {
-            if (self.bind_addr) |v| self.allocator.free(@constCast(v));
-        }
         if (self.via_proxy_name_owned) {
             if (self.via_proxy_name) |v| self.allocator.free(@constCast(v));
         }
@@ -294,6 +306,20 @@ pub const Config = struct {
         if (self.reverse_initialized) {
             self.reverse.deinit();
         }
+    }
+
+    /// Add a listen address directive value.
+    pub fn addListenAddress(self: *Self, addr: []const u8) !void {
+        const duped = try self.allocator.dupe(u8, addr);
+        errdefer self.allocator.free(duped);
+        try self.listen_addrs.append(self.allocator, duped);
+    }
+
+    /// Add a bind address directive value.
+    pub fn addBindAddress(self: *Self, addr: []const u8) !void {
+        const duped = try self.allocator.dupe(u8, addr);
+        errdefer self.allocator.free(duped);
+        try self.bind_addrs.append(self.allocator, duped);
     }
 
     // ========================================================================
@@ -448,7 +474,7 @@ test "Config init and deinit" {
     defer config.deinit();
 
     try std.testing.expectEqual(@as(u16, 9999), config.port);
-    try std.testing.expectEqualStrings("127.0.0.1", config.listen);
+    try std.testing.expectEqual(@as(usize, 0), config.listen_addrs.items.len);
 }
 
 test "Config anonymous header whitelist" {
