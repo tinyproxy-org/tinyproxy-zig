@@ -2,8 +2,7 @@
 
 ## Project Overview
 
-**tinyproxy-zig** is a Zig implementation of the tinyproxy HTTP/HTTPS proxy daemon,
-built on top of the zio coroutine and async I/O framework.
+**tinyproxy-zig** is a Zig implementation of the tinyproxy HTTP/HTTPS proxy, built on top of the zio async I/O framework.
 
 ### Important: Rewrite Guidelines
 
@@ -19,7 +18,7 @@ This project is a **rewrite of tinyproxy in Zig**. When implementing features:
 
 ## Tech Stack
 
-- **Language**: Zig 0.15.2
+- **Language**: Zig 0.16.0
 - **Async Runtime**: zio (stackful coroutines + io_uring/kqueue/epoll)
 - **Reference**: tinyproxy (C version) - functionality parity goal
 
@@ -31,44 +30,11 @@ This project is a **rewrite of tinyproxy in Zig**. When implementing features:
 - Naming: `snake_case` for functions/variables, `PascalCase` for types
 - Documentation: use `///` doc comments for public APIs
 
-## Workspace Policy
-
-- Do not create or use git worktrees
-- Make all changes in the main workspace
-
 ## Architecture
 
 - **Single-threaded coroutine model**: one coroutine per connection
 - **Modular design**: each feature is a separate `.zig` file
 - **Configuration-driven**: all features controllable via config file
-
-## Key Modules
-
-| Module | Purpose |
-|--------|---------|
-| `request.zig` | Main request handling logic |
-| `conf.zig` | Configuration parsing |
-| `acl.zig` | Access control lists |
-| `upstream.zig` | Upstream proxy support |
-| `filter.zig` | URL filtering |
-
-## Implementation Phases
-
-| Phase | Focus | Status |
-|-------|-------|--------|
-| Phase 1 | Configuration, Logging | 🚧 Partial (struct done, file parsing pending) |
-| Phase 2 | HTTP Enhancement, Headers, Anonymous | ✅ Done (headers, anonymous integrated) |
-| Phase 3 | ACL, Auth, Filter, Connect Ports | 🚧 Partial (connect ports done) |
-| Phase 4 | Upstream, Reverse, Transparent Proxy | Not Started |
-| Phase 5 | Stats, Signals, Daemon, Error Pages | Not Started |
-
-See `docs/plans/2026-01-11-implementation-roadmap.md` for detailed plan.
-
-## Testing
-
-- Minimal testing strategy: core functionality only
-- Run tests: `zig build test`
-- Manual testing: `curl -x http://127.0.0.1:9999 http://example.com`
 
 ## Common Tasks
 
@@ -87,23 +53,4 @@ See `docs/plans/2026-01-11-implementation-roadmap.md` for detailed plan.
 ## Reference Repositories
 
 - **tinyproxy (C)**: `../../tinyproxy` - functionality reference
-- **zio**: `../zio` - async I/O library
-
-<!-- OPENSPEC:START -->
-## OpenSpec Instructions
-
-These instructions are for AI assistants working in this project.
-
-Always open `@/openspec/AGENTS.md` when the request:
-- Mentions planning or proposals (words like proposal, spec, change, plan)
-- Introduces new capabilities, breaking changes, architecture shifts, or big performance/security work
-- Sounds ambiguous and you need the authoritative spec before coding
-
-Use `@/openspec/AGENTS.md` to learn:
-- How to create and apply change proposals
-- Spec format and conventions
-- Project structure and guidelines
-
-Keep this managed block so 'openspec update' can refresh the instructions.
-
-<!-- OPENSPEC:END -->
+- **zio**: `../../dacheng-zig/zio` - async I/O library

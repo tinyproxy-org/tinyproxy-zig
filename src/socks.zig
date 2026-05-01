@@ -231,10 +231,8 @@ test "socks4a_handshake_writes_request" {
         .read_buf = &resp,
         .write_buf = &write_buf,
     };
-    // Note: read_exact doesn't actually use rt parameter, so fake pointer is safe for testing
-    const dummy_rt: *zio.Runtime = @ptrFromInt(1);
-
-    try connect(dummy_rt, &stream, upstream.ProxyType.socks4, null, null, "example.com", 443);
+    var dummy_rt: zio.Runtime = undefined;
+    try connect(&dummy_rt, &stream, upstream.ProxyType.socks4, null, null, "example.com", 443);
     const written = stream.write_buf[0..stream.write_pos];
 
     try testing.expectEqual(@as(u8, 4), written[0]);
@@ -253,9 +251,8 @@ test "socks5_no_auth_handshake_writes_methods_and_connect" {
         .read_buf = &resp,
         .write_buf = &write_buf,
     };
-    const dummy_rt: *zio.Runtime = @ptrFromInt(1);
-
-    try connect(dummy_rt, &stream, upstream.ProxyType.socks5, null, null, "example.com", 443);
+    var dummy_rt: zio.Runtime = undefined;
+    try connect(&dummy_rt, &stream, upstream.ProxyType.socks5, null, null, "example.com", 443);
     const written = stream.write_buf[0..stream.write_pos];
 
     try testing.expectEqual(@as(u8, 5), written[0]);
@@ -266,8 +263,8 @@ test "socks5_auth_handshake_writes_auth" {
     const resp = [_]u8{
         5, 2, // method selection: user/pass
         1, 0, // auth success
-        5, 0, 0, 1, // connect response: ok, IPv4
-        127, 0, 0, 1,
+        5,    0,    0, 1, // connect response: ok, IPv4
+        127,  0,    0, 1,
         0x1F, 0x90,
     };
     var write_buf: [512]u8 = undefined;
@@ -275,9 +272,8 @@ test "socks5_auth_handshake_writes_auth" {
         .read_buf = &resp,
         .write_buf = &write_buf,
     };
-    const dummy_rt: *zio.Runtime = @ptrFromInt(1);
-
-    try connect(dummy_rt, &stream, upstream.ProxyType.socks5, "user", "pass", "example.com", 443);
+    var dummy_rt: zio.Runtime = undefined;
+    try connect(&dummy_rt, &stream, upstream.ProxyType.socks5, "user", "pass", "example.com", 443);
     const written = stream.write_buf[0..stream.write_pos];
 
     try testing.expect(std.mem.indexOf(u8, written, "user") != null);

@@ -9,6 +9,7 @@
 //!   const html = try stats.global.renderHtml(allocator);
 
 const std = @import("std");
+const time_compat = @import("time_compat.zig");
 
 /// Global statistics instance
 pub var global: Stats = .{};
@@ -39,12 +40,12 @@ pub const Stats = struct {
     /// Initialize start time (call once at startup)
     pub fn initStartTime(self: *Self) void {
         const expected: i64 = 0;
-        _ = self.start_time.cmpxchgStrong(expected, std.time.timestamp(), .monotonic, .monotonic);
+        _ = self.start_time.cmpxchgStrong(expected, time_compat.timestamp(), .monotonic, .monotonic);
     }
 
     pub fn init() Self {
         var s = Self{};
-        s.start_time.store(std.time.timestamp(), .monotonic);
+        s.start_time.store(time_compat.timestamp(), .monotonic);
         return s;
     }
 
@@ -97,7 +98,7 @@ pub const Stats = struct {
 
     /// Get uptime in seconds
     pub fn getUptime(self: *const Self) u64 {
-        const now = std.time.timestamp();
+        const now = time_compat.timestamp();
         const start = self.start_time.load(.monotonic);
         const diff = now - start;
         return if (diff > 0) @intCast(diff) else 0;
@@ -176,15 +177,10 @@ pub const Stats = struct {
     ///   {refusedconnections} - connections refused by ACL
     ///   {totalrequests} - total requests processed
     ///   {badrequests} - malformed requests
-    pub fn renderFromTemplate(self: *const Self, allocator: std.mem.Allocator, template_path: []const u8) ![]const u8 {
+    pub fn renderFromTemplate(self: *const Self, io: std.Io, allocator: std.mem.Allocator, template_path: []const u8) ![]const u8 {
         // Read template file
-        const file = std.fs.cwd().openFile(template_path, .{}) catch {
+        const template = std.Io.Dir.cwd().readFileAlloc(io, template_path, allocator, .limited(1024 * 1024)) catch {
             // Fall back to default template if file not found
-            return self.renderHtml(allocator);
-        };
-        defer file.close();
-
-        const template = file.readToEndAlloc(allocator, 1024 * 1024) catch {
             return self.renderHtml(allocator);
         };
         defer allocator.free(template);

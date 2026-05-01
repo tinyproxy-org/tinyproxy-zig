@@ -1,6 +1,5 @@
 const std = @import("std");
 const mem = std.mem;
-const net = std.net;
 const posix = std.posix;
 const zio = @import("zio");
 
@@ -75,9 +74,9 @@ pub fn connectWithBindList(
 
 /// get peer (remote) address from the socket
 /// Returns true if successful, false on error
-pub fn get_peer_addr(sock: posix.socket_t, addr: *net.Address) bool {
-    var addr_len: posix.socklen_t = @sizeOf(net.Address);
-    return posix.getpeername(sock, &addr.any, &addr_len) == null;
+pub fn get_peer_addr(sock: posix.socket_t, addr: *zio.net.Address) bool {
+    var addr_len: posix.socklen_t = @sizeOf(zio.net.Address);
+    return std.c.getpeername(sock, &addr.any, &addr_len) == 0;
 }
 
 /// get local address from the socket and format to string (IP only, no port)
@@ -85,7 +84,7 @@ pub fn get_peer_addr(sock: posix.socket_t, addr: *net.Address) bool {
 pub fn get_local_addr_str(sock: posix.socket_t, buf: []u8) ?[]const u8 {
     var storage: posix.sockaddr.storage = undefined;
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    posix.getsockname(sock, @ptrCast(&storage), &addr_len) catch return null;
+    if (std.c.getsockname(sock, @ptrCast(&storage), &addr_len) != 0) return null;
 
     // Validate minimum buffer size (IPv4 max 15 chars + null, IPv6 needs more)
     if (buf.len < 46) return null; // Max IPv6 string length
@@ -99,12 +98,13 @@ pub fn get_local_addr_str(sock: posix.socket_t, buf: []u8) ?[]const u8 {
     } else if (family == posix.AF.INET6) {
         const addr6: *const posix.sockaddr.in6 = @ptrCast(&storage);
         // Format IPv6 address (RFC 5952: lowercase, no unnecessary leading zeros)
-        return std.fmt.bufPrint(buf,
+        return std.fmt.bufPrint(
+            buf,
             "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}",
             .{
-                addr6.addr[0], addr6.addr[1], addr6.addr[2], addr6.addr[3],
-                addr6.addr[4], addr6.addr[5], addr6.addr[6], addr6.addr[7],
-                addr6.addr[8], addr6.addr[9], addr6.addr[10], addr6.addr[11],
+                addr6.addr[0],  addr6.addr[1],  addr6.addr[2],  addr6.addr[3],
+                addr6.addr[4],  addr6.addr[5],  addr6.addr[6],  addr6.addr[7],
+                addr6.addr[8],  addr6.addr[9],  addr6.addr[10], addr6.addr[11],
                 addr6.addr[12], addr6.addr[13], addr6.addr[14], addr6.addr[15],
             },
         ) catch return null;

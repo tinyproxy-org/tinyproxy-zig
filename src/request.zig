@@ -51,6 +51,7 @@ const ERROR_502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nProxy h
 /// Send an error response using configured ErrorFile or default template
 fn sendErrorResponse(
     rt: *zio.Runtime,
+    io: std.Io,
     stream: *zio.net.Stream,
     config: *const Config,
     err: html_error.HttpError,
@@ -58,7 +59,7 @@ fn sendErrorResponse(
 ) !void {
     // Try to use custom error file first
     if (config.error_files.get(@intFromEnum(err))) |error_file| {
-        if (loadErrorFile(rt.allocator, error_file)) |content| {
+        if (loadErrorFile(io, rt.allocator, error_file)) |content| {
             defer rt.allocator.free(content);
             var header_buf: [512]u8 = undefined;
             const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 {s}\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
@@ -77,7 +78,7 @@ fn sendErrorResponse(
 
     // Try default error file
     if (config.default_error_file) |default_file| {
-        if (loadErrorFile(rt.allocator, default_file)) |content| {
+        if (loadErrorFile(io, rt.allocator, default_file)) |content| {
             defer rt.allocator.free(content);
             var header_buf: [512]u8 = undefined;
             const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 {s}\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
@@ -119,12 +120,8 @@ fn sendErrorResponse(
     try stream.writeAll(body, .none);
 }
 
-fn loadErrorFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
-    const stat = file.stat() catch return null;
-    if (stat.size > 1024 * 1024) return null; // Max 1MB
-    return file.readToEndAlloc(allocator, 1024 * 1024) catch null;
+fn loadErrorFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch null;
 }
 
 fn appendAddHeaders(message: *http.HttpMessage, config: *const Config) !void {
@@ -457,7 +454,7 @@ fn writeHttpProxyAuthHeader(upstream: *zio.net.Stream, proxy: *const upstream_mo
 }
 
 /// Handle an incoming client connection
-pub fn handle_connection(rt: *zio.Runtime, client: zio.net.Stream, config: *const Config) !void {
+pub fn handle_connection(rt: *zio.Runtime, io: std.Io, client: zio.net.Stream, config: *const Config) !void {
     var stream = client;
     defer stream.close();
 
@@ -485,7 +482,7 @@ pub fn handle_connection(rt: *zio.Runtime, client: zio.net.Stream, config: *cons
     // Check if this is a stats page request
     if (config.stat_host) |stat_host| {
         if (std.ascii.eqlIgnoreCase(req.host, stat_host)) {
-            try sendStatsResponse(rt, &stream, config);
+            try sendStatsResponse(rt, io, &stream, config);
             return;
         }
     }
@@ -615,7 +612,7 @@ fn rewriteLocationHeader(msg: *http.HttpMessage, config: *const Config, allocato
                     const path = rest[path_start..];
                     // Rewrite to base_url + path
                     const new_value = std.fmt.allocPrint(allocator, "{s}{s}", .{
-                        std.mem.trimRight(u8, base_url, "/"),
+                        std.mem.trimEnd(u8, base_url, "/"),
                         path,
                     }) catch continue;
                     allocator.free(header.value);
@@ -646,10 +643,10 @@ fn injectMagicCookie(rt: *zio.Runtime, msg: *http.HttpMessage, path_prefix: []co
     // Ownership transferred to header_list/headers
 }
 
-fn sendStatsResponse(rt: *zio.Runtime, stream: *zio.net.Stream, config: *const Config) !void {
+fn sendStatsResponse(rt: *zio.Runtime, io: std.Io, stream: *zio.net.Stream, config: *const Config) !void {
     // Use custom template if configured, otherwise use default
     const body = if (config.stat_file) |template_path|
-        try stats.global.renderFromTemplate(rt.allocator, template_path)
+        try stats.global.renderFromTemplate(io, rt.allocator, template_path)
     else
         try stats.global.renderHtml(rt.allocator);
     defer rt.allocator.free(body);
@@ -692,16 +689,32 @@ fn strip_username_password(host: []u8) usize {
     return bytes_to_copy;
 }
 
-fn strip_return_port(host: []u8) struct { port: u16, new_len: usize } {
-    const colon_pos = std.mem.lastIndexOf(u8, host, ":") orelse return .{ .port = 0, .new_len = host.len };
-    const after_colon = host[colon_pos + 1 ..];
-    if (std.mem.indexOf(u8, after_colon, "]") != null) {
-        return .{ .port = 0, .new_len = host.len };
+fn split_host_port(authority: []const u8, default_port: u16) !struct { host: []const u8, port: u16 } {
+    if (authority.len == 0) return error.BadRequest;
+
+    if (authority[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, authority, ']') orelse return error.BadRequest;
+        const host = authority[1..end];
+        if (host.len == 0) return error.BadRequest;
+        if (end + 1 == authority.len) return .{ .host = host, .port = default_port };
+        if (authority[end + 1] != ':') return error.BadRequest;
+        const port_str = authority[end + 2 ..];
+        if (port_str.len == 0) return error.BadRequest;
+        return .{ .host = host, .port = std.fmt.parseInt(u16, port_str, 10) catch return error.BadRequest };
     }
 
-    const port_str = std.mem.trim(u8, after_colon, " \t\r\n\x00");
-    const port = std.fmt.parseInt(u16, port_str, 10) catch return .{ .port = 0, .new_len = host.len };
-    return .{ .port = port, .new_len = colon_pos };
+    if (std.mem.indexOfScalar(u8, authority, ':')) |first_colon| {
+        if (std.mem.indexOfScalarPos(u8, authority, first_colon + 1, ':') != null) {
+            return .{ .host = authority, .port = default_port };
+        }
+
+        const host = authority[0..first_colon];
+        const port_str = authority[first_colon + 1 ..];
+        if (host.len == 0 or port_str.len == 0) return error.BadRequest;
+        return .{ .host = host, .port = std.fmt.parseInt(u16, port_str, 10) catch return error.BadRequest };
+    }
+
+    return .{ .host = authority, .port = default_port };
 }
 
 /// Check if a string contains characters unsafe for HTTP header interpolation.
@@ -713,8 +726,10 @@ fn containsHttpUnsafe(s: []const u8) bool {
 fn extract_url(allocator: std.mem.Allocator, url: []const u8, default_port: u16, req: *Request) !void {
     const slash_pos = std.mem.indexOf(u8, url, "/");
 
-    const host_part = if (slash_pos) |pos| url[0..pos] else url;
+    const authority = if (slash_pos) |pos| url[0..pos] else url;
     const path_part = if (slash_pos) |pos| url[pos..] else "/";
+    const host_port = try split_host_port(authority, default_port);
+    const host_part = host_port.host;
 
     // Validate hostname length to prevent DoS
     if (host_part.len > MAX_HOSTNAME_LENGTH) {
@@ -733,9 +748,7 @@ fn extract_url(allocator: std.mem.Allocator, url: []const u8, default_port: u16,
     errdefer allocator.free(path_buffer);
 
     var host_len = strip_username_password(host_buffer);
-    const port_result = strip_return_port(host_buffer[0..host_len]);
-    host_len = port_result.new_len;
-    const port = if (port_result.port != 0) port_result.port else default_port;
+    const port = host_port.port;
 
     if (host_len > 2 and host_buffer[0] == '[') {
         const bracket_end = std.mem.lastIndexOf(u8, host_buffer[0..host_len], "]");
@@ -783,18 +796,7 @@ pub fn process_request_line(
         try extract_url(allocator, req_line.uri, HTTPS_PORT, req);
     } else {
         const host_header = header_map.get("host") orelse return error.BadRequest;
-        var host_parts = std.mem.splitScalar(u8, host_header, ':');
-        const host_part = host_parts.next() orelse return error.BadRequest;
-        const port_str = host_parts.next();
-        const port = if (port_str) |p| std.fmt.parseInt(u16, p, 10) catch HTTP_PORT else HTTP_PORT;
-
-        const host_port_str = if (port_str) |_|
-            try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host_part, port })
-        else
-            try allocator.dupe(u8, host_part);
-        defer allocator.free(host_port_str);
-
-        try extract_url(allocator, host_port_str, port, req);
+        try extract_url(allocator, host_header, HTTP_PORT, req);
         allocator.free(req.path);
         req.path = try allocator.dupe(u8, req_line.uri);
     }
@@ -825,6 +827,27 @@ test "process_request with absolute URL" {
     try std.testing.expectEqualStrings("example.com", req.host);
     try std.testing.expectEqualStrings("/hello", req.path);
     try std.testing.expectEqual(@as(u16, 80), req.port);
+}
+
+test "process_request with bracketed IPv6 host header" {
+    var header_map = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer header_map.deinit();
+    try header_map.put("host", "[::1]:8080");
+
+    const req = try process_request_line(std.testing.allocator, "GET /hello HTTP/1.1", &header_map);
+    defer free_request(std.testing.allocator, req);
+
+    try std.testing.expectEqualStrings("::1", req.host);
+    try std.testing.expectEqualStrings("/hello", req.path);
+    try std.testing.expectEqual(@as(u16, 8080), req.port);
+}
+
+test "process_request rejects invalid host port" {
+    var header_map = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer header_map.deinit();
+    try header_map.put("host", "example.com:notaport");
+
+    try std.testing.expectError(error.BadRequest, process_request_line(std.testing.allocator, "GET /hello HTTP/1.1", &header_map));
 }
 
 test "reject host with CRLF injection" {
@@ -932,10 +955,14 @@ fn connectTarget(rt: *zio.Runtime, req: *const Request, config: *const Config, c
     const target_port = if (proxy) |p| p.port else req.port;
 
     const addr = zio.net.IpAddress.parseIp(target_host, target_port) catch blk: {
-        const list = try std.net.getAddressList(rt.allocator, target_host, target_port);
-        defer list.deinit();
-        if (list.addrs.len == 0) return error.UnknownHostName;
-        break :blk zio.net.IpAddress.fromStd(list.addrs[0]);
+        const host = try zio.net.HostName.init(target_host);
+        var result = try host.lookup(.{ .port = target_port });
+        defer result.deinit();
+        while (result.next()) |entry| switch (entry) {
+            .address => |resolved| break :blk resolved,
+            .canonical_name => {},
+        };
+        return error.UnknownHostName;
     };
 
     // Determine bind behavior: BindSame takes precedence over Bind directives.

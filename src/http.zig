@@ -108,7 +108,7 @@ pub const BodyReader = struct {
                     defer reader.allocator.free(size_line);
                     try writer.writeAll(size_line, .none);
 
-                    const size_trim = std.mem.trimRight(u8, size_line, "\r\n");
+                    const size_trim = std.mem.trimEnd(u8, size_line, "\r\n");
                     const semi = std.mem.indexOfScalar(u8, size_trim, ';') orelse size_trim.len;
                     const size_str = std.mem.trim(u8, size_trim[0..semi], " \t");
                     if (size_str.len == 0) return error.InvalidChunk;
@@ -122,7 +122,7 @@ pub const BodyReader = struct {
                             const trailer = try reader.readLine(rt, stream);
                             defer reader.allocator.free(trailer);
                             try writer.writeAll(trailer, .none);
-                            const trailer_trim = std.mem.trimRight(u8, trailer, "\r\n");
+                            const trailer_trim = std.mem.trimEnd(u8, trailer, "\r\n");
                             if (trailer_trim.len == 0) break;
                         }
                         break;
@@ -147,7 +147,7 @@ pub const BodyReader = struct {
 };
 
 pub fn parse_request_line(line: []const u8) HttpError!RequestLine {
-    const trimmed = std.mem.trimRight(u8, line, "\r\n");
+    const trimmed = std.mem.trimEnd(u8, line, "\r\n");
     var parts = std.mem.splitScalar(u8, trimmed, ' ');
     const method = parts.next() orelse return error.BadRequest;
 
@@ -181,11 +181,12 @@ pub fn read_headers(
     var message = HttpMessage.init(allocator);
     errdefer message.deinit();
     var last_header_index: ?usize = null;
+    var seen_content_length: ?usize = null;
 
     while (true) {
         const line = try reader.readLine(rt, stream);
         defer allocator.free(line);
-        const trimmed = std.mem.trimRight(u8, line, "\r\n");
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
         if (trimmed.len == 0) break;
 
         // RFC 7230 obsolete line folding support (C tinyproxy-compatible).
@@ -214,32 +215,41 @@ pub fn read_headers(
         }
 
         const name = try allocator.dupe(u8, name_raw);
+        errdefer allocator.free(name);
         for (name) |*c| c.* = std.ascii.toLower(c.*);
         const value = try allocator.dupe(u8, value_raw);
+        errdefer allocator.free(value);
 
         // Check header limit BEFORE appending to prevent bypass
         if (message.header_list.items.len >= MAX_HEADERS) {
-            allocator.free(name);
-            allocator.free(value);
             return error.TooManyHeaders;
         }
 
-        try message.header_list.append(allocator, .{ .name = name, .value = value });
-        try message.headers.put(name, value);
-        last_header_index = message.header_list.items.len - 1;
-
         if (std.mem.eql(u8, name, "content-length")) {
-            message.content_length = std.fmt.parseInt(usize, value_raw, 10) catch return error.InvalidContentLength;
+            if (message.is_chunked) return error.InvalidHeader;
+            const parsed_len = std.fmt.parseInt(usize, value_raw, 10) catch return error.InvalidContentLength;
+            if (seen_content_length) |previous_len| {
+                if (previous_len != parsed_len) return error.InvalidContentLength;
+            } else {
+                seen_content_length = parsed_len;
+                message.content_length = parsed_len;
+            }
         } else if (std.mem.eql(u8, name, "transfer-encoding")) {
             var it = std.mem.splitScalar(u8, value_raw, ',');
             while (it.next()) |token| {
                 const part = std.mem.trim(u8, token, " \t");
                 if (std.ascii.eqlIgnoreCase(part, "chunked")) {
+                    if (seen_content_length != null) return error.InvalidHeader;
                     message.is_chunked = true;
                     break;
                 }
             }
         }
+
+        try message.header_list.append(allocator, .{ .name = name, .value = value });
+        errdefer _ = message.header_list.pop();
+        try message.headers.put(name, value);
+        last_header_index = message.header_list.items.len - 1;
     }
 
     return message;
@@ -254,7 +264,7 @@ test "parse request line http11" {
 }
 
 fn malformed_header_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
-    var stream = try server.accept();
+    var stream = try server.accept(.{});
     defer stream.close();
 
     var reader = buffer.LineReader.init(rt.allocator, buffer.MAX_LINE_LENGTH);
@@ -273,18 +283,18 @@ fn malformed_header_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
 }
 
 test "read headers skips malformed lines and supports folded continuation" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18086);
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.close();
 
     var server_task = try rt.spawn(malformed_header_server, .{ rt, &server });
 
-    var client = try addr.connect(.{});
+    var client = try server.socket.address.ip.connect(.{});
     defer client.close();
 
     try client.writeAll(
@@ -310,7 +320,7 @@ const TestWriter = struct {
 };
 
 fn content_length_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
-    var stream = try server.accept();
+    var stream = try server.accept(.{});
     defer stream.close();
 
     var reader = buffer.LineReader.init(rt.allocator, buffer.MAX_LINE_LENGTH);
@@ -335,18 +345,18 @@ fn content_length_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
 }
 
 test "read content-length body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18082);
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.close();
 
     var server_task = try rt.spawn(content_length_server, .{ rt, &server });
 
-    var client = try addr.connect(.{});
+    var client = try server.socket.address.ip.connect(.{});
     defer client.close();
 
     try client.writeAll(
@@ -362,7 +372,7 @@ test "read content-length body" {
 }
 
 fn chunked_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
-    var stream = try server.accept();
+    var stream = try server.accept(.{});
     defer stream.close();
 
     var reader = buffer.LineReader.init(rt.allocator, buffer.MAX_LINE_LENGTH);
@@ -390,18 +400,18 @@ fn chunked_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
 }
 
 test "read chunked body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18083);
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.close();
 
     var server_task = try rt.spawn(chunked_server, .{ rt, &server });
 
-    var client = try addr.connect(.{});
+    var client = try server.socket.address.ip.connect(.{});
     defer client.close();
 
     try client.writeAll(
@@ -410,6 +420,90 @@ test "read chunked body" {
             "Transfer-Encoding: chunked\r\n" ++
             "\r\n" ++
             "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+        .none,
+    );
+
+    try server_task.join();
+}
+
+fn conflicting_content_length_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
+    var stream = try server.accept(.{});
+    defer stream.close();
+
+    var reader = buffer.LineReader.init(rt.allocator, buffer.MAX_LINE_LENGTH);
+    defer reader.deinit();
+
+    const line = try reader.readLine(rt, &stream);
+    defer rt.allocator.free(line);
+    _ = try parse_request_line(line);
+
+    try std.testing.expectError(error.InvalidContentLength, read_headers(rt.allocator, &reader, rt, &stream));
+}
+
+test "read headers rejects conflicting content-length" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.close();
+
+    var server_task = try rt.spawn(conflicting_content_length_server, .{ rt, &server });
+
+    var client = try server.socket.address.ip.connect(.{});
+    defer client.close();
+
+    try client.writeAll(
+        "POST /submit HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Content-Length: 6\r\n" ++
+            "\r\n" ++
+            "hello!",
+        .none,
+    );
+
+    try server_task.join();
+}
+
+fn transfer_encoding_with_content_length_server(rt: *zio.Runtime, server: *zio.net.Server) !void {
+    var stream = try server.accept(.{});
+    defer stream.close();
+
+    var reader = buffer.LineReader.init(rt.allocator, buffer.MAX_LINE_LENGTH);
+    defer reader.deinit();
+
+    const line = try reader.readLine(rt, &stream);
+    defer rt.allocator.free(line);
+    _ = try parse_request_line(line);
+
+    try std.testing.expectError(error.InvalidHeader, read_headers(rt.allocator, &reader, rt, &stream));
+}
+
+test "read headers rejects transfer-encoding with content-length" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.close();
+
+    var server_task = try rt.spawn(transfer_encoding_with_content_length_server, .{ rt, &server });
+
+    var client = try server.socket.address.ip.connect(.{});
+    defer client.close();
+
+    try client.writeAll(
+        "POST /submit HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "0\r\n\r\n",
         .none,
     );
 

@@ -7,7 +7,7 @@ Built on top of the [zio](https://github.com/lalinsky/zio) coroutine and async I
 ## Design
 
 - **Single-threaded coroutine model**: one coroutine per connection
-- **Async I/O**: zio provides io_uring (Linux), kqueue (macOS), epoll fallback
+- **Async I/O**: zio provides io_uring (Linux), kqueue (macOS), epoll fallback, iocp (Windows)
 - **Feature parity goal**: implement all tinyproxy features in idiomatic Zig
 
 ## Features
@@ -37,7 +37,7 @@ Built on top of the [zio](https://github.com/lalinsky/zio) coroutine and async I
 ### Phase 5: Production
 - [x] Statistics page (StatHost, StatFile)
 - [x] Signal handling (SIGTERM/SIGINT/SIGUSR1/SIGHUP)
-- [x] Config reload on SIGHUP
+- [x] Config reload on SIGHUP (runtime settings reload; Listen/Port changes require restart)
 - [x] Daemon mode (daemonize, PID file, privilege drop)
 - [x] Custom error pages (ErrorFile, DefaultErrorFile)
 
@@ -75,19 +75,18 @@ wrk -c 100 -t 4 http://127.0.0.1:9999
 
 ## Development
 
-See [docs/roadmap.md](docs/roadmap.md) for detailed implementation plan.
+See project docs for detailed implementation plans.
 
 ### Project Structure
 
 ```
 src/
 ├── main.zig          # Entry point
-├── runtime.zig       # zio runtime wrapper
 ├── child.zig         # Connection accept loop
 ├── request.zig       # Request handling
 ├── relay.zig         # Bidirectional data relay
 ├── buffer.zig        # Line reader
-├── config.zig        # Configuration (WIP)
+├── config.zig        # Runtime configuration
 └── ...
 ```
 

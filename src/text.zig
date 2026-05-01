@@ -30,3 +30,21 @@ pub fn chomp(buffer: []u8) !usize {
 
     return chars_removed;
 }
+
+test "chomp removes trailing line endings" {
+    var buffer = [_]u8{ 'h', 'i', '\r', '\n' };
+
+    try std.testing.expectEqual(@as(usize, 2), try chomp(&buffer));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 'h', 'i', 0, 0 }, &buffer);
+}
+
+test "chomp leaves content without trailing line endings" {
+    var buffer = [_]u8{ 'h', 'i' };
+
+    try std.testing.expectEqual(@as(usize, 0), try chomp(&buffer));
+    try std.testing.expectEqualSlices(u8, "hi", &buffer);
+}
+
+test "chomp rejects empty buffer" {
+    try std.testing.expectError(error.InvalidLength, chomp(&.{}));
+}

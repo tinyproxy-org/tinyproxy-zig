@@ -1,13 +1,8 @@
 const std = @import("std");
 const zio = @import("zio");
 
-fn upstream(_: *zio.Runtime, ready: *zio.ResetEvent) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 19000);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.close();
-    ready.set();
-
-    var stream = try server.accept();
+fn upstream(_: *zio.Runtime, server: *zio.net.Server) !void {
+    var stream = try server.accept(.{});
     defer stream.close();
 
     var buf: [256]u8 = undefined;
@@ -16,16 +11,17 @@ fn upstream(_: *zio.Runtime, ready: *zio.ResetEvent) !void {
 }
 
 test "forward proxy relays response" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
 
-    var ready = zio.ResetEvent.init;
-    var upstream_task = try rt.spawn(upstream, .{ rt, &ready });
-    try ready.wait();
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.close();
+    var upstream_task = try rt.spawn(upstream, .{ rt, &listener });
 
-    const response = try forward_once(rt, "127.0.0.1", 19000);
+    const response = try forward_once(rt, "127.0.0.1", listener.socket.address.ip.getPort());
     defer rt.allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "200 OK") != null);

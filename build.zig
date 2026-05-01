@@ -1,5 +1,12 @@
 const std = @import("std");
 
+const TestSpec = struct {
+    name: []const u8,
+    path: []const u8,
+    needs_zio: bool = false,
+    serial: bool = false,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -33,172 +40,63 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const child_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/child.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    child_test_mod.addImport("zio", zio_mod);
-
-    const child_tests = b.addTest(.{
-        .name = "child-tests",
-        .root_module = child_test_mod,
-    });
-    const child_run = b.addRunArtifact(child_tests);
-
-    const proxy_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/proxy.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    proxy_test_mod.addImport("zio", zio_mod);
-
-    const proxy_tests = b.addTest(.{
-        .name = "proxy-tests",
-        .root_module = proxy_test_mod,
-    });
-    const proxy_run = b.addRunArtifact(proxy_tests);
-
-    const relay_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/relay.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    relay_test_mod.addImport("zio", zio_mod);
-
-    const relay_tests = b.addTest(.{
-        .name = "relay-tests",
-        .root_module = relay_test_mod,
-    });
-    const relay_run = b.addRunArtifact(relay_tests);
-
-    const main_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    main_test_mod.addImport("zio", zio_mod);
-
-    const main_tests = b.addTest(.{
-        .name = "main-tests",
-        .root_module = main_test_mod,
-    });
-    const main_run = b.addRunArtifact(main_tests);
-
-    const conf_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/conf.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const conf_tests = b.addTest(.{
-        .name = "conf-tests",
-        .root_module = conf_test_mod,
-    });
-    const conf_run = b.addRunArtifact(conf_tests);
-
-    const config_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/config.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const config_tests = b.addTest(.{
-        .name = "config-tests",
-        .root_module = config_test_mod,
-    });
-    const config_run = b.addRunArtifact(config_tests);
-
-    const log_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/log.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const log_tests = b.addTest(.{
-        .name = "log-tests",
-        .root_module = log_test_mod,
-    });
-    const log_run = b.addRunArtifact(log_tests);
-
-    const acl_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/acl.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const acl_tests = b.addTest(.{
-        .name = "acl-tests",
-        .root_module = acl_test_mod,
-    });
-    const acl_run = b.addRunArtifact(acl_tests);
-
-    const auth_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/auth.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const auth_tests = b.addTest(.{
-        .name = "auth-tests",
-        .root_module = auth_test_mod,
-    });
-    const auth_run = b.addRunArtifact(auth_tests);
-
-    const http_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/http.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    http_test_mod.addImport("zio", zio_mod);
-
-    const http_tests = b.addTest(.{
-        .name = "http-tests",
-        .root_module = http_test_mod,
-    });
-    const http_run = b.addRunArtifact(http_tests);
-
     const test_step = b.step("test", "Run tests");
 
-    // Network tests share buffer.zig test ports (18081, 18084, 18085)
-    // via transitive imports, so they must run sequentially.
-    http_run.step.dependOn(&child_run.step);
-    relay_run.step.dependOn(&http_run.step);
-    main_run.step.dependOn(&relay_run.step);
+    const test_specs = [_]TestSpec{
+        .{ .name = "acl-tests", .path = "src/acl.zig", .needs_zio = true },
+        .{ .name = "anonymous-tests", .path = "src/anonymous.zig", .needs_zio = true },
+        .{ .name = "auth-tests", .path = "src/auth.zig" },
+        .{ .name = "buffer-tests", .path = "src/buffer.zig", .needs_zio = true },
+        .{ .name = "child-tests", .path = "src/child.zig", .needs_zio = true, .serial = true },
+        .{ .name = "conf-tests", .path = "src/conf.zig", .needs_zio = true },
+        .{ .name = "config-tests", .path = "src/config.zig", .needs_zio = true },
+        .{ .name = "connect-ports-tests", .path = "src/connect_ports.zig", .needs_zio = true },
+        .{ .name = "daemon-tests", .path = "src/daemon.zig" },
+        .{ .name = "filter-tests", .path = "src/filter.zig" },
+        .{ .name = "headers-tests", .path = "src/headers.zig", .needs_zio = true },
+        .{ .name = "html-error-tests", .path = "src/html_error.zig" },
+        .{ .name = "http-tests", .path = "src/http.zig", .needs_zio = true, .serial = true },
+        .{ .name = "log-tests", .path = "src/log.zig" },
+        .{ .name = "pool-tests", .path = "src/pool.zig" },
+        .{ .name = "proxy-tests", .path = "src/proxy.zig", .needs_zio = true },
+        .{ .name = "relay-tests", .path = "src/relay.zig", .needs_zio = true, .serial = true },
+        .{ .name = "main-tests", .path = "src/main.zig", .needs_zio = true, .serial = true },
+        .{ .name = "request-tests", .path = "src/request.zig", .needs_zio = true },
+        .{ .name = "reverse-tests", .path = "src/reverse.zig", .needs_zio = true },
+        .{ .name = "signals-tests", .path = "src/signals.zig" },
+        .{ .name = "socks-tests", .path = "src/socks.zig", .needs_zio = true },
+        .{ .name = "stats-tests", .path = "src/stats.zig" },
+        .{ .name = "text-tests", .path = "src/text.zig" },
+        .{ .name = "transparent-tests", .path = "src/transparent.zig" },
+        .{ .name = "upstream-tests", .path = "src/upstream.zig", .needs_zio = true },
+    };
 
-    test_step.dependOn(&child_run.step);
-    test_step.dependOn(&proxy_run.step);
-    test_step.dependOn(&relay_run.step);
-    test_step.dependOn(&main_run.step);
-    test_step.dependOn(&conf_run.step);
-    test_step.dependOn(&config_run.step);
-    test_step.dependOn(&log_run.step);
-    test_step.dependOn(&acl_run.step);
+    var previous_serial_run: ?*std.Build.Step.Run = null;
 
-    const signals_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/signals.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const signals_tests = b.addTest(.{
-        .name = "signals-tests",
-        .root_module = signals_test_mod,
-    });
-    const signals_run = b.addRunArtifact(signals_tests);
-    test_step.dependOn(&signals_run.step);
+    inline for (test_specs) |spec| {
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path(spec.path),
+            .target = target,
+            .optimize = optimize,
+        });
 
-    const upstream_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/upstream.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const upstream_tests = b.addTest(.{
-        .name = "upstream-tests",
-        .root_module = upstream_test_mod,
-    });
-    const upstream_run = b.addRunArtifact(upstream_tests);
-    test_step.dependOn(&upstream_run.step);
+        if (spec.needs_zio) {
+            test_mod.addImport("zio", zio_mod);
+        }
 
-    test_step.dependOn(&auth_run.step);
-    test_step.dependOn(&http_run.step);
+        const tests = b.addTest(.{
+            .name = spec.name,
+            .root_module = test_mod,
+        });
+        const run = b.addRunArtifact(tests);
+
+        if (spec.serial) {
+            if (previous_serial_run) |previous_run| {
+                run.step.dependOn(&previous_run.step);
+            }
+            previous_serial_run = run;
+        }
+
+        test_step.dependOn(&run.step);
+    }
 }

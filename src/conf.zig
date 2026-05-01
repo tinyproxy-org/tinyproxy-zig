@@ -14,6 +14,7 @@
 //!   ConnectPort 8000-9000
 
 const std = @import("std");
+const zio = @import("zio");
 const Config = @import("config.zig").Config;
 const PortRange = @import("config.zig").PortRange;
 const LogLevel = @import("config.zig").LogLevel;
@@ -176,40 +177,42 @@ pub const Directive = enum {
 };
 
 /// Parse a configuration file from disk
-pub fn parseFile(allocator: std.mem.Allocator, path: []const u8) !Config {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+pub fn parseFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Config {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
 
-    const stat = file.stat() catch |err| {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        stderr.print("Failed to stat config '{s}': {}\n", .{ path, err }) catch {};
+    const stat = file.stat(io) catch |err| {
+        std.debug.print("Failed to stat config '{s}': {}\n", .{ path, err });
         return err;
     };
     const max_size = 1024 * 1024; // 1MB max
     if (stat.size > max_size) {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        stderr.print("Config file '{s}' too large ({d} > {d} bytes). Consider splitting into multiple files.\n", .{ path, stat.size, max_size }) catch {};
+        std.debug.print("Config file '{s}' too large ({d} > {d} bytes). Consider splitting into multiple files.\n", .{ path, stat.size, max_size });
         return error.ConfigFileTooLarge;
     }
 
-    const content = try file.readToEndAlloc(allocator, max_size);
+    var reader = file.reader(io, &.{});
+    const content = try reader.interface.allocRemaining(allocator, .limited(max_size));
     defer allocator.free(content);
 
-    return parseText(allocator, content);
+    return parseTextWithIo(io, allocator, content);
 }
 
 /// Reload an existing config from disk, replacing it on success.
-pub fn reloadConfig(config: *Config, path: []const u8) !void {
+pub fn reloadConfig(io: std.Io, config: *Config, path: []const u8) !void {
     if (path.len == 0) return error.MissingConfigPath;
 
-    var new_config = try parseFile(config.allocator, path);
+    var new_config = try parseFile(io, config.allocator, path);
     errdefer new_config.deinit();
 
     config.deinit();
     config.* = new_config;
 }
 
-/// Parse configuration from text (useful for testing)
+/// Parse configuration from text.
+///
+/// Directives that load external files, such as `Filter`, require an explicit
+/// I/O backend. Use `parseTextWithIo` for those configs.
 pub fn parseText(allocator: std.mem.Allocator, text: []const u8) !Config {
     var config = Config.init(allocator);
     errdefer config.deinit();
@@ -224,15 +227,44 @@ pub fn parseText(allocator: std.mem.Allocator, text: []const u8) !Config {
         // Skip empty lines and comments
         if (line.len == 0 or line[0] == '#') continue;
 
+        if (lineDirective(line)) |directive| {
+            if (directive == .filter) return error.MissingIoBackend;
+        }
+
+        // Parse the line with a failing I/O backend. The pre-scan above keeps
+        // the public API usable for in-memory configs while rejecting external
+        // file directives with an explicit error.
+        try parseLine(std.Io.failing, allocator, &config, line);
+    }
+
+    return config;
+}
+
+/// Parse configuration from text with an explicit I/O backend for directives
+/// that load external files.
+pub fn parseTextWithIo(io: std.Io, allocator: std.mem.Allocator, text: []const u8) !Config {
+    var config = Config.init(allocator);
+    errdefer config.deinit();
+
+    var line_num: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+
+    while (lines.next()) |line_raw| {
+        line_num += 1;
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+
+        // Skip empty lines and comments
+        if (line.len == 0 or line[0] == '#') continue;
+
         // Parse the line
-        try parseLine(allocator, &config, line);
+        try parseLine(io, allocator, &config, line);
     }
 
     return config;
 }
 
 /// Parse a single configuration line
-fn parseLine(allocator: std.mem.Allocator, config: *Config, line: []const u8) !void {
+fn parseLine(io: std.Io, allocator: std.mem.Allocator, config: *Config, line: []const u8) !void {
     // Split into keyword and rest
     var iter = std.mem.tokenizeAny(u8, line, " \t");
     const keyword = iter.next() orelse return;
@@ -366,7 +398,7 @@ fn parseLine(allocator: std.mem.Allocator, config: *Config, line: []const u8) !v
         // Filter configuration
         .filter => {
             const value = try parseValue(rest, true);
-            config.loadFilterFile(value) catch |err| {
+            config.loadFilterFile(io, value) catch |err| {
                 return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.MissingValue, // File not found or read error
@@ -530,6 +562,12 @@ fn parseLine(allocator: std.mem.Allocator, config: *Config, line: []const u8) !v
     }
 }
 
+fn lineDirective(line: []const u8) ?Directive {
+    var iter = std.mem.tokenizeAny(u8, line, " \t");
+    const keyword = iter.next() orelse return null;
+    return Directive.fromString(keyword);
+}
+
 /// Parse a value from the rest of the line
 /// Handles quoted strings if allow_quoted is true
 fn parseValue(rest: []const u8, allow_quoted: bool) ![]const u8 {
@@ -548,7 +586,7 @@ fn parseValue(rest: []const u8, allow_quoted: bool) ![]const u8 {
 }
 
 fn parseToken(input: *[]const u8) ![]const u8 {
-    var trimmed = std.mem.trimLeft(u8, input.*, " \t");
+    var trimmed = std.mem.trimStart(u8, input.*, " \t");
     if (trimmed.len == 0) return error.MissingValue;
 
     if (trimmed[0] == '"') {
@@ -672,11 +710,7 @@ inline fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 fn validateIpLiteral(value: []const u8) !void {
-    _ = std.net.Address.parseIp4(value, 0) catch {
-        _ = std.net.Address.parseIp6(value, 0) catch return error.InvalidSyntax;
-        return;
-    };
-    return;
+    _ = zio.net.IpAddress.parseIp(value, 0) catch return error.InvalidSyntax;
 }
 
 // ============================================================================
@@ -765,6 +799,11 @@ test "parse quoted values" {
 
     try std.testing.expectEqualStrings("/var/log/tinyproxy.log", config.log_file.?);
     try std.testing.expectEqualStrings("My Proxy Server", config.via_proxy_name.?);
+}
+
+test "parseText rejects file-backed directives without I/O backend" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.MissingIoBackend, parseText(allocator, "Filter /tmp/filter\n"));
 }
 
 test "parse anonymous headers" {
@@ -917,9 +956,9 @@ test "parse acl rules" {
     var config = try parseText(allocator, text);
     defer config.deinit();
 
-    const localhost = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const internal = std.net.Address.initIp4(.{ 192, 168, 1, 100 }, 0);
-    const external = std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 0);
+    const localhost = zio.net.IpAddress.initIp4(.{ 127, 0, 0, 1 }, 0);
+    const internal = zio.net.IpAddress.initIp4(.{ 192, 168, 1, 100 }, 0);
+    const external = zio.net.IpAddress.initIp4(.{ 8, 8, 8, 8 }, 0);
 
     const AclAction = @import("acl.zig").AclAction;
     try std.testing.expectEqual(AclAction.allow, config.acl.check(localhost));
@@ -929,6 +968,10 @@ test "parse acl rules" {
 
 test "invalid acl rules are ignored (tinyproxy-compatible)" {
     const allocator = std.testing.allocator;
+    const original_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = original_log_level;
+
     const text =
         \\Deny 0.0.0.0/0
         \\Allow not-an-address
@@ -937,7 +980,7 @@ test "invalid acl rules are ignored (tinyproxy-compatible)" {
     var config = try parseText(allocator, text);
     defer config.deinit();
 
-    const localhost = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    const localhost = zio.net.IpAddress.initIp4(.{ 127, 0, 0, 1 }, 0);
     const AclAction = @import("acl.zig").AclAction;
     try std.testing.expectEqual(AclAction.deny, config.acl.check(localhost));
 }
@@ -999,19 +1042,19 @@ test "reload config applies new values" {
 
     const filename = "tinyproxy.conf";
     {
-        var file = try tmp.dir.createFile(filename, .{});
-        defer file.close();
-        try file.writeAll("Port 8888\nListen 0.0.0.0\n");
+        var file = try tmp.dir.createFile(std.testing.io, filename, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "Port 8888\nListen 0.0.0.0\n");
     }
 
-    const path = try tmp.dir.realpathAlloc(allocator, filename);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, filename, allocator);
     defer allocator.free(path);
 
     var config = Config.init(allocator);
     defer config.deinit();
 
     try std.testing.expectEqual(@as(u16, 9999), config.port);
-    try reloadConfig(&config, path);
+    try reloadConfig(std.testing.io, &config, path);
     try std.testing.expectEqual(@as(u16, 8888), config.port);
     try std.testing.expectEqual(@as(usize, 1), config.listen_addrs.items.len);
     try std.testing.expectEqualStrings("0.0.0.0", config.listen_addrs.items[0]);
@@ -1024,19 +1067,19 @@ test "reload config keeps previous values on error" {
 
     const filename = "tinyproxy.conf";
     {
-        var file = try tmp.dir.createFile(filename, .{});
-        defer file.close();
-        try file.writeAll("Port not-a-number\n");
+        var file = try tmp.dir.createFile(std.testing.io, filename, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "Port not-a-number\n");
     }
 
-    const path = try tmp.dir.realpathAlloc(allocator, filename);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, filename, allocator);
     defer allocator.free(path);
 
     var config = Config.init(allocator);
     defer config.deinit();
 
     const original_port = config.port;
-    try std.testing.expectError(error.InvalidPort, reloadConfig(&config, path));
+    try std.testing.expectError(error.InvalidPort, reloadConfig(std.testing.io, &config, path));
     try std.testing.expectEqual(original_port, config.port);
 }
 

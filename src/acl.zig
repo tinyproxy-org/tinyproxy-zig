@@ -18,6 +18,7 @@
 //!   const action = acl.check(client_addr);
 
 const std = @import("std");
+const zio = @import("zio");
 
 /// ACL action
 pub const AclAction = enum {
@@ -105,7 +106,7 @@ pub const HostSpec = union(enum) {
     /// Note: Domain matching (.domain suffix) always returns false for Address matching
     /// because it requires a hostname string, not an IP address. Use matchesHost()
     /// for domain-based matching against hostname strings.
-    pub fn matches(self: HostSpec, addr: std.net.Address) bool {
+    pub fn matches(self: HostSpec, addr: zio.net.IpAddress) bool {
         return switch (self) {
             .ip4 => |ip4| matchIp4Single(ip4, addr),
             .ip4_cidr => |cidr| matchIp4Cidr(cidr.addr, cidr.prefix_len, addr),
@@ -133,10 +134,7 @@ pub const HostSpec = union(enum) {
             else => {
                 // Try parsing host as IP. If fast parse fails, assume no match.
                 // We do NOT perform DNS lookup here to avoid blocking.
-                const addr = std.net.Address.parseIp4(host, 0) catch blk: {
-                    const ip6 = std.net.Address.parseIp6(host, 0) catch return false;
-                    break :blk ip6;
-                };
+                const addr = zio.net.IpAddress.parseIp(host, 0) catch return false;
                 return self.matches(addr);
             },
         }
@@ -191,7 +189,7 @@ pub const Acl = struct {
 
     /// Check if an address is allowed
     /// Returns the action from the last matching rule, or .deny if no rules match
-    pub fn check(self: *const Self, addr: std.net.Address) AclAction {
+    pub fn check(self: *const Self, addr: zio.net.IpAddress) AclAction {
         // No rules = deny by default (tinyproxy behavior)
         if (self.entries.items.len == 0) {
             return .deny;
@@ -241,35 +239,30 @@ fn parseIp4(s: []const u8) ?[4]u8 {
     return result;
 }
 
-fn matchIp4Single(spec: [4]u8, addr: std.net.Address) bool {
-    switch (addr.any.family) {
-        std.posix.AF.INET => {
-            const client_bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
-            return std.mem.eql(u8, &spec, client_bytes);
-        },
-        std.posix.AF.INET6 => {
+fn matchIp4Single(spec: [4]u8, addr: zio.net.IpAddress) bool {
+    switch (addr.getFamily()) {
+        .ipv4 => return std.mem.eql(u8, &spec, std.mem.asBytes(&addr.in.addr)),
+        .ipv6 => {
             // Check for IPv4-mapped IPv6 (::ffff:a.b.c.d)
-            const ip6_bytes = &addr.in6.sa.addr;
+            const ip6_bytes = &addr.in6.addr;
             if (isIp4MappedIp6(ip6_bytes)) {
                 return std.mem.eql(u8, &spec, ip6_bytes[12..16]);
             }
             return false;
         },
-        else => return false,
     }
 }
 
-fn matchIp4Cidr(spec: [4]u8, prefix_len: u5, addr: std.net.Address) bool {
-    const client_bytes: [4]u8 = switch (addr.any.family) {
-        std.posix.AF.INET => @as(*const [4]u8, @ptrCast(&addr.in.sa.addr)).*,
-        std.posix.AF.INET6 => blk: {
-            const ip6_bytes = &addr.in6.sa.addr;
+fn matchIp4Cidr(spec: [4]u8, prefix_len: u5, addr: zio.net.IpAddress) bool {
+    const client_bytes: [4]u8 = switch (addr.getFamily()) {
+        .ipv4 => std.mem.asBytes(&addr.in.addr)[0..4].*,
+        .ipv6 => blk: {
+            const ip6_bytes = &addr.in6.addr;
             if (isIp4MappedIp6(ip6_bytes)) {
                 break :blk ip6_bytes[12..16].*;
             }
             return false;
         },
-        else => return false,
     };
 
     return matchCidr(u32, spec, client_bytes, prefix_len);
@@ -338,39 +331,33 @@ fn parseIp6(s: []const u8) ?[16]u8 {
     return result;
 }
 
-fn matchIp6Single(spec: [16]u8, addr: std.net.Address) bool {
-    switch (addr.any.family) {
-        std.posix.AF.INET6 => {
-            return std.mem.eql(u8, &spec, &addr.in6.sa.addr);
-        },
-        std.posix.AF.INET => {
+fn matchIp6Single(spec: [16]u8, addr: zio.net.IpAddress) bool {
+    switch (addr.getFamily()) {
+        .ipv6 => return std.mem.eql(u8, &spec, &addr.in6.addr),
+        .ipv4 => {
             // Check if spec is IPv4-mapped and client is IPv4
             if (isIp4MappedIp6(&spec)) {
-                const client_bytes = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
-                return std.mem.eql(u8, spec[12..16], client_bytes);
+                return std.mem.eql(u8, spec[12..16], std.mem.asBytes(&addr.in.addr));
             }
             return false;
         },
-        else => return false,
     }
 }
 
-fn matchIp6Cidr(spec: [16]u8, prefix_len: u7, addr: std.net.Address) bool {
-    const client_bytes: [16]u8 = switch (addr.any.family) {
-        std.posix.AF.INET6 => addr.in6.sa.addr,
-        std.posix.AF.INET => blk: {
+fn matchIp6Cidr(spec: [16]u8, prefix_len: u7, addr: zio.net.IpAddress) bool {
+    const client_bytes: [16]u8 = switch (addr.getFamily()) {
+        .ipv6 => addr.in6.addr,
+        .ipv4 => blk: {
             // Convert IPv4 to IPv4-mapped IPv6
             if (isIp4MappedIp6(&spec)) {
                 var mapped: [16]u8 = std.mem.zeroes([16]u8);
                 mapped[10] = 0xFF;
                 mapped[11] = 0xFF;
-                const client_v4 = @as(*const [4]u8, @ptrCast(&addr.in.sa.addr));
-                @memcpy(mapped[12..16], client_v4);
+                @memcpy(mapped[12..16], std.mem.asBytes(&addr.in.addr));
                 break :blk mapped;
             }
             return false;
         },
-        else => return false,
     };
 
     return matchCidr(u128, spec, client_bytes, prefix_len);
@@ -494,8 +481,8 @@ test "Acl basic allow/deny" {
     try acl.allow("127.0.0.1");
 
     // Create test addresses
-    const localhost = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const other = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 0);
+    const localhost = zio.net.IpAddress.initIp4(.{ 127, 0, 0, 1 }, 0);
+    const other = zio.net.IpAddress.initIp4(.{ 10, 0, 0, 1 }, 0);
 
     try std.testing.expectEqual(AclAction.allow, acl.check(localhost));
     try std.testing.expectEqual(AclAction.deny, acl.check(other));
@@ -505,7 +492,7 @@ test "Acl empty denies by default" {
     var acl = Acl.init(std.testing.allocator);
     defer acl.deinit();
 
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    const addr = zio.net.IpAddress.initIp4(.{ 127, 0, 0, 1 }, 0);
     try std.testing.expectEqual(AclAction.deny, acl.check(addr));
 }
 
@@ -516,8 +503,8 @@ test "Acl last rule wins" {
     try acl.deny("192.168.0.0/16");
     try acl.allow("192.168.1.0/24");
 
-    const addr1 = std.net.Address.initIp4(.{ 192, 168, 1, 100 }, 0);
-    const addr2 = std.net.Address.initIp4(.{ 192, 168, 2, 100 }, 0);
+    const addr1 = zio.net.IpAddress.initIp4(.{ 192, 168, 1, 100 }, 0);
+    const addr2 = zio.net.IpAddress.initIp4(.{ 192, 168, 2, 100 }, 0);
 
     // 192.168.1.100 matches both rules, last (allow) wins
     try std.testing.expectEqual(AclAction.allow, acl.check(addr1));

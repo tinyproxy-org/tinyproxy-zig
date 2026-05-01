@@ -137,6 +137,10 @@ const detail_section_template =
     \\<div class="detail">{DETAIL}</div>
 ;
 
+fn replaceAllOwned(allocator: std.mem.Allocator, input: []const u8, needle: []const u8, replacement: []const u8) ![]const u8 {
+    return std.mem.replaceOwned(u8, allocator, input, needle, replacement);
+}
+
 /// Render an error page to HTML
 pub fn renderErrorPage(
     allocator: std.mem.Allocator,
@@ -149,7 +153,7 @@ pub fn renderErrorPage(
     defer if (detail_section_owned) allocator.free(detail_section);
 
     if (ctx.detail.len > 0) {
-        detail_section = try std.fmt.allocPrint(allocator, detail_section_template, .{ctx.detail});
+        detail_section = try replaceAllOwned(allocator, detail_section_template, "{DETAIL}", ctx.detail);
         detail_section_owned = true;
     }
 
@@ -163,14 +167,26 @@ pub fn renderErrorPage(
         message_owned = true;
     }
 
-    return std.fmt.allocPrint(allocator, default_template, .{
-        err.title(),
-        @intFromEnum(err),
-        err.title(),
-        message,
-        detail_section,
-        VERSION,
-    });
+    const code = try std.fmt.allocPrint(allocator, "{d}", .{@intFromEnum(err)});
+    defer allocator.free(code);
+
+    var html = try replaceAllOwned(allocator, default_template, "{TITLE}", err.title());
+    errdefer allocator.free(html);
+
+    const replacements = .{
+        .{ "{CODE}", code },
+        .{ "{MESSAGE}", message },
+        .{ "{DETAIL_SECTION}", detail_section },
+        .{ "{VERSION}", VERSION },
+    };
+
+    inline for (replacements) |replacement| {
+        const next = try replaceAllOwned(allocator, html, replacement[0], replacement[1]);
+        allocator.free(html);
+        html = next;
+    }
+
+    return html;
 }
 
 /// Send an error response with HTML body

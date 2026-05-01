@@ -85,20 +85,20 @@ pub fn close_listen_sockets() void {
     }
 }
 
-fn reloadConfigAndLogging(config: *Config, config_path: []const u8) void {
+fn reloadConfigAndLogging(io: std.Io, config: *Config, config_path: []const u8) void {
     if (config_path.len == 0) {
         log.warn("SIGHUP received but no config file path is configured", .{});
         return;
     }
 
-    conf_parser.reloadConfig(config, config_path) catch |err| {
+    conf_parser.reloadConfig(io, config, config_path) catch |err| {
         log.err("Config reload failed for '{s}': {}", .{ config_path, err });
         return;
     };
 
     // Match tinyproxy behavior: reload also reopens/reconfigures logging backend.
     logger.deinit();
-    logger.init(config) catch |err| {
+    logger.init(io, config) catch |err| {
         log.err("Logger reinit failed after config reload: {}", .{err});
         return;
     };
@@ -106,7 +106,7 @@ fn reloadConfigAndLogging(config: *Config, config_path: []const u8) void {
     log.info("Configuration reloaded from '{s}'", .{config_path});
 }
 
-fn rotateLogFile(config: *const Config) void {
+fn rotateLogFile(io: std.Io, config: *const Config) void {
     if (config.use_syslog) {
         // No file descriptor to reopen when syslog backend is active.
         log.info("SIGUSR1 received, ignoring reopen because syslog is enabled", .{});
@@ -118,7 +118,7 @@ fn rotateLogFile(config: *const Config) void {
         return;
     };
 
-    logger.reopen(path) catch |err| {
+    logger.reopen(io, path) catch |err| {
         log.err("Failed to reopen log file '{s}': {}", .{ path, err });
         return;
     };
@@ -126,7 +126,7 @@ fn rotateLogFile(config: *const Config) void {
     log.info("Log file reopened: '{s}'", .{path});
 }
 
-pub fn main_loop(rt: *zio.Runtime, config: *Config, config_path: []const u8) !void {
+pub fn main_loop(rt: *zio.Runtime, io: std.Io, config: *Config, config_path: []const u8) !void {
     log.info("main_loop: starting main loop", .{});
     if (listen_servers.items.len == 0) return error.NotListening;
     shutting_down.store(false, .release);
@@ -141,7 +141,7 @@ pub fn main_loop(rt: *zio.Runtime, config: *Config, config_path: []const u8) !vo
         close_listen_sockets();
     }
     for (listen_servers.items) |server| {
-        const handle = try rt.spawn(acceptLoop, .{ rt, server, config });
+        const handle = try rt.spawn(acceptLoop, .{ rt, io, server, config });
         try accept_handles.append(rt.allocator, handle);
     }
 
@@ -164,7 +164,7 @@ pub fn main_loop(rt: *zio.Runtime, config: *Config, config_path: []const u8) !vo
     while (true) {
         if (reload_pending and active_connections.load(.acquire) == 0) {
             reload_pending = false;
-            reloadConfigAndLogging(config, config_path);
+            reloadConfigAndLogging(io, config, config_path);
         }
 
         const result = zio.select(.{
@@ -185,14 +185,14 @@ pub fn main_loop(rt: *zio.Runtime, config: *Config, config_path: []const u8) !vo
             },
             .hup => {
                 if (active_connections.load(.acquire) == 0) {
-                    reloadConfigAndLogging(config, config_path);
+                    reloadConfigAndLogging(io, config, config_path);
                 } else {
                     reload_pending = true;
                     log.info("SIGHUP received, deferring reload until active connections drain", .{});
                 }
             },
             .usr1 => {
-                rotateLogFile(config);
+                rotateLogFile(io, config);
             },
             .tick => {},
         }
@@ -215,18 +215,18 @@ pub fn main_loop(rt: *zio.Runtime, config: *Config, config_path: []const u8) !vo
     log.info("Main loop exited", .{});
 }
 
-fn acceptLoop(rt: *zio.Runtime, server: zio.net.Server, config: *Config) void {
+fn acceptLoop(rt: *zio.Runtime, io: std.Io, server: zio.net.Server, config: *Config) void {
     while (!shutting_down.load(.acquire)) {
-        const stream = server.accept() catch |err| {
+        const stream = server.accept(.{}) catch |err| {
             if (shutting_down.load(.acquire)) break;
             log.err("accept failed on {f}: {}", .{ server.socket.address, err });
             continue;
         };
-        handleAcceptedConnection(rt, stream, config);
+        handleAcceptedConnection(rt, io, stream, config);
     }
 }
 
-fn handleAcceptedConnection(rt: *zio.Runtime, stream: zio.net.Stream, config: *Config) void {
+fn handleAcceptedConnection(rt: *zio.Runtime, io: std.Io, stream: zio.net.Stream, config: *Config) void {
     stats.global.recordOpen();
 
     // Check MaxClients limit
@@ -242,7 +242,7 @@ fn handleAcceptedConnection(rt: *zio.Runtime, stream: zio.net.Stream, config: *C
 
     // Check ACL if rules are configured
     if (config.acl.hasRules()) {
-        const client_addr = stream.socket.address.toStd();
+        const client_addr = stream.socket.address.ip;
         const action = config.acl.check(client_addr);
         if (action == .deny) {
             log.info("Connection denied by ACL from {f}", .{stream.socket.address.ip});
@@ -264,7 +264,7 @@ fn handleAcceptedConnection(rt: *zio.Runtime, stream: zio.net.Stream, config: *C
     // Increment active connections before handing over ownership to handler.
     _ = active_connections.fetchAdd(1, .monotonic);
 
-    _ = rt.spawn(handleConnectionWithCounter, .{ rt, stream, config }) catch |err| {
+    _ = rt.spawn(handleConnectionWithCounter, .{ rt, io, stream, config }) catch |err| {
         _ = active_connections.fetchSub(1, .monotonic);
         stats.global.recordClose();
         stream.close();
@@ -275,24 +275,24 @@ fn handleAcceptedConnection(rt: *zio.Runtime, stream: zio.net.Stream, config: *C
 }
 
 /// Wrapper that handles connection and decrements counter on completion
-fn handleConnectionWithCounter(rt: *zio.Runtime, stream: zio.net.Stream, config: *const Config) void {
+fn handleConnectionWithCounter(rt: *zio.Runtime, io: std.Io, stream: zio.net.Stream, config: *const Config) void {
     defer {
         _ = active_connections.fetchSub(1, .monotonic);
         stats.global.recordClose();
     }
-    request.handle_connection(rt, stream, config) catch |err| {
+    request.handle_connection(rt, io, stream, config) catch |err| {
         log.err("Connection handler error: {}", .{err});
     };
 }
 
 pub fn accept_once(_: *zio.Runtime) !void {
     if (listen_servers.items.len == 0) return error.NotListening;
-    const stream = try listen_servers.items[0].accept();
+    const stream = try listen_servers.items[0].accept(.{});
     stream.close();
 }
 
 test "accepts one connection" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
@@ -301,7 +301,7 @@ test "accepts one connection" {
 
     var test_config = Config.init(gpa.allocator());
     try test_config.addListenAddress("127.0.0.1");
-    test_config.port = 18080;
+    test_config.port = 0;
     defer test_config.deinit();
 
     var server_task = try rt.spawn(struct {
@@ -315,8 +315,8 @@ test "accepts one connection" {
 
     try ready.wait();
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18080);
-    var stream = try addr.connect(.{});
+    const listen_addr = listen_servers.items[0].socket.address.ip;
+    var stream = try listen_addr.connect(.{});
     stream.close();
 
     try server_task.join();

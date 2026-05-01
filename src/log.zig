@@ -5,7 +5,7 @@
 //!
 //! Usage:
 //!   const log = @import("log.zig");
-//!   try log.init(&config);
+//!   try log.init(io, &config);
 //!   defer log.deinit();
 //!
 //!   log.info("Connection from {s}", .{client_ip});
@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
 const ConfigLogLevel = @import("config.zig").LogLevel;
+const time_compat = @import("time_compat.zig");
 
 // ============================================================================
 // Syslog bindings (POSIX)
@@ -114,11 +115,12 @@ pub const LogLevel = enum(u8) {
 
 /// Global logger state
 const LogState = struct {
-    file: ?std.fs.File = null,
+    io: ?std.Io = null,
+    file: ?std.Io.File = null,
     min_level: LogLevel = .info,
     use_syslog: bool = false,
     initialized: bool = false,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 };
 
 var state: LogState = .{};
@@ -127,10 +129,11 @@ var state: LogState = .{};
 var format_buf: [4096]u8 = undefined;
 
 /// Initialize the logging system
-pub fn init(config: *const Config) !void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
+pub fn init(io: std.Io, config: *const Config) !void {
+    state.mutex.lockUncancelable(io);
+    defer state.mutex.unlock(io);
 
+    state.io = io;
     if (state.initialized) {
         // Already initialized, just update settings
         state.min_level = LogLevel.fromConfig(config.log_level);
@@ -149,7 +152,7 @@ pub fn init(config: *const Config) !void {
 
     // Open log file if specified
     if (config.log_file) |path| {
-        state.file = std.fs.cwd().createFile(path, .{
+        state.file = std.Io.Dir.cwd().createFile(io, path, .{
             .truncate = false,
         }) catch |e| {
             // Fall back to stderr
@@ -160,7 +163,8 @@ pub fn init(config: *const Config) !void {
 
         // Seek to end for append mode
         if (state.file) |f| {
-            f.seekFromEnd(0) catch {};
+            const len = f.length(io) catch 0;
+            io.vtable.fileSeekTo(io.userdata, f, len) catch {};
         }
     }
 
@@ -169,37 +173,42 @@ pub fn init(config: *const Config) !void {
 
 /// Deinitialize the logging system
 pub fn deinit() void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    const io = state.io orelse return;
+    state.mutex.lockUncancelable(io);
+    defer state.mutex.unlock(io);
 
     if (state.use_syslog) {
         syslog.closelog();
     }
 
     if (state.file) |f| {
-        f.close();
+        f.close(io);
         state.file = null;
     }
+    state.io = null;
     state.initialized = false;
 }
 
 /// Reopen log file (for log rotation via SIGUSR1)
-pub fn reopen(path: []const u8) !void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
+pub fn reopen(io: std.Io, path: []const u8) !void {
+    state.mutex.lockUncancelable(io);
+    defer state.mutex.unlock(io);
+
+    state.io = io;
 
     // Close existing file
     if (state.file) |f| {
-        f.close();
+        f.close(io);
     }
 
     // Open new file
-    state.file = try std.fs.cwd().createFile(path, .{
+    state.file = try std.Io.Dir.cwd().createFile(io, path, .{
         .truncate = false,
     });
 
     if (state.file) |f| {
-        f.seekFromEnd(0) catch {};
+        const len = f.length(io) catch 0;
+        io.vtable.fileSeekTo(io.userdata, f, len) catch {};
     }
 }
 
@@ -212,8 +221,9 @@ pub fn isEnabled(level: LogLevel) bool {
 pub fn logFn(level: LogLevel, comptime fmt: []const u8, args: anytype) void {
     if (!isEnabled(level)) return;
 
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    const io = state.io orelse return;
+    state.mutex.lockUncancelable(io);
+    defer state.mutex.unlock(io);
 
     // Use syslog if enabled
     if (state.use_syslog) {
@@ -233,14 +243,14 @@ pub fn logFn(level: LogLevel, comptime fmt: []const u8, args: anytype) void {
 
     // Write to file or stderr
     if (state.file) |f| {
-        _ = f.write(msg) catch {};
+        f.writeStreamingAll(io, msg) catch {};
     } else {
-        std.fs.File.stderr().writeAll(msg) catch {};
+        std.debug.print("{s}", .{msg});
     }
 }
 
 fn getTimestamp() [19]u8 {
-    const epoch_seconds: i64 = std.time.timestamp();
+    const epoch_seconds: i64 = time_compat.timestamp();
 
     // Handle negative timestamps (before 1970) - just use a default
     if (epoch_seconds < 0) {
@@ -350,8 +360,9 @@ pub const AccessEvent = struct {
 pub fn access(event: AccessEvent) void {
     if (!isEnabled(.notice)) return;
 
-    state.mutex.lock();
-    defer state.mutex.unlock();
+    const io = state.io orelse return;
+    state.mutex.lockUncancelable(io);
+    defer state.mutex.unlock(io);
 
     const timestamp = getTimestamp();
 
@@ -367,9 +378,9 @@ pub fn access(event: AccessEvent) void {
     }) catch return;
 
     if (state.file) |f| {
-        _ = f.write(msg) catch {};
+        f.writeStreamingAll(io, msg) catch {};
     } else {
-        std.fs.File.stderr().writeAll(msg) catch {};
+        std.debug.print("{s}", .{msg});
     }
 }
 

@@ -3,12 +3,12 @@ const zio = @import("zio");
 const buffer = @import("buffer.zig");
 
 test "relay copies both directions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 19001);
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.close();
 
@@ -17,17 +17,17 @@ test "relay copies both directions" {
     var relay_task = try rt.spawn(struct {
         fn run(rt2: *zio.Runtime, srv: *zio.net.Server, ready2: *zio.ResetEvent) !void {
             ready2.set();
-            var a = try srv.accept();
+            var a = try srv.accept(.{});
             defer a.close();
-            var b = try srv.accept();
+            var b = try srv.accept(.{});
             defer b.close();
             try copy_bidi(rt2, a, b);
         }
     }.run, .{ rt, &server, &ready });
 
     try ready.wait();
-    var client_a = try addr.connect(.{});
-    var client_b = try addr.connect(.{});
+    var client_a = try server.socket.address.ip.connect(.{});
+    var client_b = try server.socket.address.ip.connect(.{});
 
     try client_a.writeAll("PING", .none);
     var out_a: [4]u8 = undefined;

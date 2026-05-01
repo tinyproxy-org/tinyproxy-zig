@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const posix = std.posix;
 
 /// Linux-specific constants for transparent proxy support
 const linux = struct {
@@ -39,7 +40,7 @@ pub const OriginalDest = struct {
 ///
 /// Returns:
 ///   The original destination if available and different from local address, null otherwise
-pub fn getOriginalDest(socket_fd: std.posix.socket_t, buf: []u8) ?OriginalDest {
+pub fn getOriginalDest(socket_fd: posix.socket_t, buf: []u8) ?OriginalDest {
     if (comptime builtin.os.tag == .linux) {
         return getOriginalDestLinux(socket_fd, buf);
     } else {
@@ -50,40 +51,41 @@ pub fn getOriginalDest(socket_fd: std.posix.socket_t, buf: []u8) ?OriginalDest {
 }
 
 /// Linux implementation using SO_ORIGINAL_DST
-fn getOriginalDestLinux(socket_fd: std.posix.socket_t, buf: []u8) ?OriginalDest {
+fn getOriginalDestLinux(socket_fd: posix.socket_t, buf: []u8) ?OriginalDest {
     // Try IPv4 first (more common)
-    var addr_v4: std.posix.sockaddr.in = undefined;
-    var len_v4: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    var addr_v4: posix.sockaddr.in = undefined;
+    var len_v4: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
-    const result_v4 = std.posix.getsockopt(
+    switch (posix.errno(std.os.linux.getsockopt(
         socket_fd,
-        linux.SOL_IP,
+        @intCast(linux.SOL_IP),
         @intCast(linux.SO_ORIGINAL_DST),
-        @as([*]u8, @ptrCast(&addr_v4))[0..@sizeOf(std.posix.sockaddr.in)],
+        @as([*]u8, @ptrCast(&addr_v4)),
         &len_v4,
-    );
+    ))) {
+        .SUCCESS => {
+            // Successfully got IPv4 original destination
+            const port = std.mem.bigToNative(u16, addr_v4.port);
+            const ip_bytes = @as(*const [4]u8, @ptrCast(&addr_v4.addr));
 
-    if (result_v4) |_| {
-        // Successfully got IPv4 original destination
-        const port = std.mem.bigToNative(u16, addr_v4.port);
-        const ip_bytes = @as(*const [4]u8, @ptrCast(&addr_v4.addr));
+            // Format the IP address into the buffer
+            const formatted = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+                ip_bytes[0],
+                ip_bytes[1],
+                ip_bytes[2],
+                ip_bytes[3],
+            }) catch return null;
 
-        // Format the IP address into the buffer
-        const formatted = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-            ip_bytes[0],
-            ip_bytes[1],
-            ip_bytes[2],
-            ip_bytes[3],
-        }) catch return null;
-
-        return .{
-            .host = formatted,
-            .port = port,
-            .is_transparent = true,
-        };
-    } else |_| {
-        // IPv4 failed, could try IPv6 here in the future
-        return null;
+            return .{
+                .host = formatted,
+                .port = port,
+                .is_transparent = true,
+            };
+        },
+        else => {
+            // IPv4 failed, could try IPv6 here in the future
+            return null;
+        },
     }
 }
 

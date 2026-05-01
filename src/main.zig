@@ -44,18 +44,18 @@ fn parseArgs(args: []const []const u8) ArgsError!CliOptions {
 }
 
 fn printUsage() void {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-    stderr.writeAll(
+    std.debug.print(
         \\Usage: tinyproxy-zig [OPTIONS]
         \\
         \\Options:
         \\  -c, --config <path>   Path to configuration file
         \\  -d, --foreground      Run in foreground (don't daemonize)
         \\
-    ) catch {};
+    , .{});
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     // Use DebugAllocator in development builds for leak detection
     var gpa = std.heap.DebugAllocator(.{
         .safety = true,
@@ -68,8 +68,9 @@ pub fn main() !void {
     }
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_arena = std.heap.ArenaAllocator.init(allocator);
+    defer args_arena.deinit();
+    const args = try init.minimal.args.toSlice(args_arena.allocator());
 
     const cli = parseArgs(args) catch |err| {
         printUsage();
@@ -79,9 +80,8 @@ pub fn main() !void {
     var conf = if (cli.config_path.len == 0)
         Config.init(allocator)
     else
-        conf_parser.parseFile(allocator, cli.config_path) catch |err| {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("Failed to load config '{s}': {}\n", .{ cli.config_path, err }) catch {};
+        conf_parser.parseFile(io, allocator, cli.config_path) catch |err| {
+            std.debug.print("Failed to load config '{s}': {}\n", .{ cli.config_path, err });
             return err;
         };
     defer conf.deinit();
@@ -89,22 +89,20 @@ pub fn main() !void {
     // Daemonize if not running in foreground mode
     if (!cli.foreground) {
         daemon.daemonize() catch |err| {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("Failed to daemonize: {}\n", .{err}) catch {};
+            std.debug.print("Failed to daemonize: {}\n", .{err});
             return err;
         };
     }
 
     // Write PID file if configured
     if (conf.pid_file) |pid_path| {
-        daemon.writePidFile(pid_path) catch |err| {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("Failed to write PID file: {}\n", .{err}) catch {};
+        daemon.writePidFile(io, pid_path) catch |err| {
+            std.debug.print("Failed to write PID file: {}\n", .{err});
             return err;
         };
     }
 
-    try logger.init(&conf);
+    try logger.init(io, &conf);
     defer logger.deinit();
 
     // Initialize statistics start time
@@ -120,21 +118,21 @@ pub fn main() !void {
     // Clean up PID file on exit
     defer {
         if (conf.pid_file) |pid_path| {
-            daemon.removePidFile(pid_path);
+            daemon.removePidFile(io, pid_path);
         }
     }
 
-    var handle = try zrt.spawn(main_task, .{ zrt, &conf, cli.config_path });
+    var handle = try zrt.spawn(main_task, .{ zrt, io, &conf, cli.config_path });
     try handle.join();
 }
 
-fn main_task(rt: *zio.Runtime, conf: *Config, config_path: []const u8) !void {
+fn main_task(rt: *zio.Runtime, io: std.Io, conf: *Config, config_path: []const u8) !void {
     const log_main = std.log.scoped(.main_task);
     log_main.info("starting", .{});
     try child.listen_socket(rt, conf);
     defer child.close_listen_sockets();
     log_main.info("listen_socket returned, calling main_loop", .{});
-    try child.main_loop(rt, conf, config_path);
+    try child.main_loop(rt, io, conf, config_path);
     log_main.info("main_loop returned", .{});
 }
 

@@ -94,11 +94,8 @@ pub const Filter = struct {
     /// Load patterns from a file (one pattern per line)
     /// Lines starting with # are comments
     /// Empty lines are ignored
-    pub fn loadFromFile(self: *Self, path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-
-        const content = try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024); // 10MB max
+    pub fn loadFromFile(self: *Self, io: std.Io, path: []const u8) !void {
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(10 * 1024 * 1024));
         defer self.allocator.free(content);
 
         try self.loadFromText(content);

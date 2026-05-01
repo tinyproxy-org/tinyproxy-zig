@@ -439,8 +439,8 @@ pub const Config = struct {
     // ========================================================================
 
     /// Load filter patterns from file
-    pub fn loadFilterFile(self: *Self, path: []const u8) !void {
-        try self.filter.loadFromFile(path);
+    pub fn loadFilterFile(self: *Self, io: std.Io, path: []const u8) !void {
+        try self.filter.loadFromFile(io, path);
 
         // Store path for potential reload
         const duped = try self.allocator.dupe(u8, path);

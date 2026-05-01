@@ -88,13 +88,8 @@ pub const LineReader = struct {
     }
 };
 
-fn server_task(rt: *zio.Runtime, ready: *zio.ResetEvent) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18081);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.close();
-    ready.set();
-
-    var stream = try server.accept();
+fn server_task(rt: *zio.Runtime, server: *zio.net.Server) !void {
+    var stream = try server.accept(.{});
     defer stream.close();
 
     var reader = LineReader.init(rt.allocator, 1024);
@@ -107,30 +102,25 @@ fn server_task(rt: *zio.Runtime, ready: *zio.ResetEvent) !void {
 }
 
 test "line reader reads one line" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
 
-    var ready = zio.ResetEvent.init;
-    var server = try rt.spawn(server_task, .{ rt, &ready });
-    try ready.wait();
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.close();
+    var server = try rt.spawn(server_task, .{ rt, &listener });
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18081);
-    var client = try addr.connect(.{});
+    var client = try listener.socket.address.ip.connect(.{});
     defer client.close();
 
     try client.writeAll("GET / HTTP/1.1\r\n", .none);
     try server.join();
 }
 
-fn server_read_buffered(rt: *zio.Runtime, ready: *zio.ResetEvent) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18084);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.close();
-    ready.set();
-
-    var stream = try server.accept();
+fn server_read_buffered(rt: *zio.Runtime, server: *zio.net.Server) !void {
+    var stream = try server.accept(.{});
     defer stream.close();
 
     var reader = LineReader.init(rt.allocator, 1024);
@@ -146,30 +136,25 @@ fn server_read_buffered(rt: *zio.Runtime, ready: *zio.ResetEvent) !void {
 }
 
 test "line reader reads buffered bytes" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
 
-    var ready = zio.ResetEvent.init;
-    var server = try rt.spawn(server_read_buffered, .{ rt, &ready });
-    try ready.wait();
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.close();
+    var server = try rt.spawn(server_read_buffered, .{ rt, &listener });
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18084);
-    var client = try addr.connect(.{});
+    var client = try listener.socket.address.ip.connect(.{});
     defer client.close();
 
     try client.writeAll("GET / HTTP/1.1\r\nBODY", .none);
     try server.join();
 }
 
-fn server_read_exact(rt: *zio.Runtime, ready: *zio.ResetEvent) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18085);
-    var server = try addr.listen(.{ .reuse_address = true });
-    defer server.close();
-    ready.set();
-
-    var stream = try server.accept();
+fn server_read_exact(rt: *zio.Runtime, server: *zio.net.Server) !void {
+    var stream = try server.accept(.{});
     defer stream.close();
 
     var reader = LineReader.init(rt.allocator, 1024);
@@ -184,17 +169,17 @@ fn server_read_exact(rt: *zio.Runtime, ready: *zio.ResetEvent) !void {
 }
 
 test "line reader read_exact fills buffer" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
     defer rt.deinit();
 
-    var ready = zio.ResetEvent.init;
-    var server = try rt.spawn(server_read_exact, .{ rt, &ready });
-    try ready.wait();
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.close();
+    var server = try rt.spawn(server_read_exact, .{ rt, &listener });
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 18085);
-    var client = try addr.connect(.{});
+    var client = try listener.socket.address.ip.connect(.{});
     defer client.close();
 
     try client.writeAll("GET / HTTP/1.1\r\nHELLO", .none);
