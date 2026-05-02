@@ -4,15 +4,45 @@ const TestSpec = struct {
     name: []const u8,
     path: []const u8,
     needs_zio: bool = false,
+    needs_build_options: bool = false,
     serial: bool = false,
 };
+
+const PackageManifest = struct {
+    version: []const u8,
+};
+
+fn packageVersion(b: *std.Build) []const u8 {
+    const manifest_source = b.build_root.handle.readFileAllocOptions(
+        b.graph.io,
+        "build.zig.zon",
+        b.allocator,
+        .limited(64 * 1024),
+        .of(u8),
+        0,
+    ) catch |err| std.debug.panic("failed to read build.zig.zon: {}", .{err});
+
+    const manifest = std.zon.parse.fromSliceAlloc(
+        PackageManifest,
+        b.allocator,
+        manifest_source,
+        null,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| std.debug.panic("failed to parse build.zig.zon: {}", .{err});
+
+    return manifest.version;
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = packageVersion(b);
 
     // zio: coroutine and async io
     const zio_mod = b.dependency("zio", .{}).module("zio");
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -21,6 +51,7 @@ pub fn build(b: *std.Build) void {
     });
 
     exe_mod.addImport("zio", zio_mod);
+    exe_mod.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = "tinyproxy",
@@ -60,7 +91,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "pool-tests", .path = "src/pool.zig" },
         .{ .name = "proxy-tests", .path = "src/proxy.zig", .needs_zio = true },
         .{ .name = "relay-tests", .path = "src/relay.zig", .needs_zio = true, .serial = true },
-        .{ .name = "main-tests", .path = "src/main.zig", .needs_zio = true, .serial = true },
+        .{ .name = "main-tests", .path = "src/main.zig", .needs_zio = true, .needs_build_options = true, .serial = true },
         .{ .name = "request-tests", .path = "src/request.zig", .needs_zio = true },
         .{ .name = "reverse-tests", .path = "src/reverse.zig", .needs_zio = true },
         .{ .name = "signals-tests", .path = "src/signals.zig" },
@@ -82,6 +113,9 @@ pub fn build(b: *std.Build) void {
 
         if (spec.needs_zio) {
             test_mod.addImport("zio", zio_mod);
+        }
+        if (spec.needs_build_options) {
+            test_mod.addOptions("build_options", build_options);
         }
 
         const tests = b.addTest(.{

@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const build_options = @import("build_options");
 const zio = @import("zio");
 
 const child = @import("child.zig");
@@ -13,47 +14,103 @@ const stats = @import("stats.zig");
 const log = std.log.scoped(.main);
 
 const DefaultConfigPath = "";
+const ExitUsage: u8 = 64;
 
 const ArgsError = error{InvalidArgs};
+const ArgsErrorDetail = union(enum) {
+    illegal_option: u8,
+    missing_argument: u8,
+};
 
 const CliOptions = struct {
     config_path: []const u8,
     foreground: bool,
+    show_help: bool,
+    show_version: bool,
 };
 
-fn parseArgs(args: []const []const u8) ArgsError!CliOptions {
+const UsageText =
+    \\Usage: tinyproxy [options]
+    \\
+    \\Options are:
+    \\  -d        Do not daemonize (run in foreground).
+    \\  -c FILE   Use an alternate configuration file.
+    \\  -h        Display this usage information.
+    \\  -v        Display version information.
+    \\
+;
+
+const VersionText = "tinyproxy " ++ build_options.version ++ "\n";
+
+fn parseArgsDetailed(args: []const []const u8, err_detail: ?*ArgsErrorDetail) ArgsError!CliOptions {
     var config_path: ?[]const u8 = null;
     var foreground: bool = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
-            if (i + 1 >= args.len) return error.InvalidArgs;
+        if (std.mem.eql(u8, arg, "-c")) {
+            if (i + 1 >= args.len) {
+                if (err_detail) |detail| detail.* = .{ .missing_argument = 'c' };
+                return error.InvalidArgs;
+            }
             config_path = args[i + 1];
             i += 1;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--foreground")) {
+        if (std.mem.eql(u8, arg, "-d")) {
             foreground = true;
             continue;
+        }
+        if (std.mem.eql(u8, arg, "-h")) {
+            return .{
+                .config_path = config_path orelse DefaultConfigPath,
+                .foreground = foreground,
+                .show_help = true,
+                .show_version = false,
+            };
+        }
+        if (std.mem.eql(u8, arg, "-v")) {
+            return .{
+                .config_path = config_path orelse DefaultConfigPath,
+                .foreground = foreground,
+                .show_help = false,
+                .show_version = true,
+            };
+        }
+        if (arg.len >= 2 and arg[0] == '-') {
+            if (err_detail) |detail| detail.* = .{ .illegal_option = arg[1] };
+            return error.InvalidArgs;
         }
         return error.InvalidArgs;
     }
     return .{
         .config_path = config_path orelse DefaultConfigPath,
         .foreground = foreground,
+        .show_help = false,
+        .show_version = false,
     };
 }
 
+fn parseArgs(args: []const []const u8) ArgsError!CliOptions {
+    return parseArgsDetailed(args, null);
+}
+
 fn printUsage() void {
-    std.debug.print(
-        \\Usage: tinyproxy-zig [OPTIONS]
-        \\
-        \\Options:
-        \\  -c, --config <path>   Path to configuration file
-        \\  -d, --foreground      Run in foreground (don't daemonize)
-        \\
-    , .{});
+    std.debug.print("{s}", .{UsageText});
+}
+
+fn printArgsError(detail: ArgsErrorDetail) void {
+    switch (detail) {
+        .illegal_option => |option| std.debug.print("tinyproxy: illegal option -- {c}\n", .{option}),
+        .missing_argument => |option| std.debug.print("tinyproxy: option requires an argument -- {c}\n", .{option}),
+    }
+    printUsage();
+}
+
+fn exitCodeForArgsError(err: ArgsError) u8 {
+    return switch (err) {
+        error.InvalidArgs => ExitUsage,
+    };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -74,10 +131,21 @@ pub fn main(init: std.process.Init) !void {
     defer args_arena.deinit();
     const args = try init.minimal.args.toSlice(args_arena.allocator());
 
-    const cli = parseArgs(args) catch |err| {
-        printUsage();
-        return err;
+    var args_error_detail: ArgsErrorDetail = .{ .illegal_option = '?' };
+    const cli = parseArgsDetailed(args, &args_error_detail) catch |err| {
+        printArgsError(args_error_detail);
+        std.process.exit(exitCodeForArgsError(err));
     };
+
+    if (cli.show_help) {
+        try std.Io.File.writeStreamingAll(.stdout(), io, UsageText);
+        return;
+    }
+
+    if (cli.show_version) {
+        try std.Io.File.writeStreamingAll(.stdout(), io, VersionText);
+        return;
+    }
 
     if (cli.config_path.len == 0) {
         log.info("using built-in default configuration", .{});
@@ -149,42 +217,65 @@ fn main_task(rt: *zio.Runtime, io: std.Io, conf: *Config, config_path: []const u
     log.info("main loop returned", .{});
 }
 
-test "parseArgs default path" {
-    const args = [_][]const u8{"tinyproxy-zig"};
-    const cli = try parseArgs(&args);
-    try std.testing.expectEqualStrings("", cli.config_path);
-    try std.testing.expect(!cli.foreground);
+const ExpectedCliOptions = struct {
+    config_path: []const u8 = DefaultConfigPath,
+    foreground: bool = false,
+    show_help: bool = false,
+    show_version: bool = false,
+};
+
+fn expectParseArgs(args: []const []const u8, expected: ExpectedCliOptions) !void {
+    const cli = try parseArgs(args);
+    try std.testing.expectEqualStrings(expected.config_path, cli.config_path);
+    try std.testing.expectEqual(expected.foreground, cli.foreground);
+    try std.testing.expectEqual(expected.show_help, cli.show_help);
+    try std.testing.expectEqual(expected.show_version, cli.show_version);
 }
 
-test "parseArgs -c" {
-    const args = [_][]const u8{ "tinyproxy-zig", "-c", "./cfg.conf" };
-    const cli = try parseArgs(&args);
-    try std.testing.expectEqualStrings("./cfg.conf", cli.config_path);
+fn expectInvalidArgs(args: []const []const u8) !void {
+    try std.testing.expectError(error.InvalidArgs, parseArgs(args));
 }
 
-test "parseArgs --config" {
-    const args = [_][]const u8{ "tinyproxy-zig", "--config", "conf/tinyproxy.conf" };
-    const cli = try parseArgs(&args);
-    try std.testing.expectEqualStrings("conf/tinyproxy.conf", cli.config_path);
+test "parseArgs accepts upstream short options" {
+    try expectParseArgs(&.{"tinyproxy"}, .{});
+    try expectParseArgs(&.{ "tinyproxy", "-d", "-c", "test.conf" }, .{
+        .config_path = "test.conf",
+        .foreground = true,
+    });
+    try expectParseArgs(&.{ "tinyproxy", "-h" }, .{
+        .show_help = true,
+    });
+    try expectParseArgs(&.{ "tinyproxy", "-v" }, .{
+        .show_version = true,
+    });
 }
 
-test "parseArgs -d foreground" {
-    const args = [_][]const u8{ "tinyproxy-zig", "-d" };
-    const cli = try parseArgs(&args);
-    try std.testing.expect(cli.foreground);
+test "VersionText uses build package version" {
+    try std.testing.expectEqualStrings("tinyproxy " ++ build_options.version ++ "\n", VersionText);
 }
 
-test "parseArgs combined options" {
-    const args = [_][]const u8{ "tinyproxy-zig", "-d", "-c", "test.conf" };
-    const cli = try parseArgs(&args);
-    try std.testing.expect(cli.foreground);
-    try std.testing.expectEqualStrings("test.conf", cli.config_path);
+test "parseArgs rejects non-upstream argument forms" {
+    const invalid_args = [_][]const []const u8{
+        &.{ "tinyproxy", "-c" },
+        &.{ "tinyproxy", "--config", "conf/tinyproxy.conf" },
+        &.{ "tinyproxy", "--foreground" },
+        &.{ "tinyproxy", "--help" },
+        &.{ "tinyproxy", "--version" },
+        &.{ "tinyproxy", "unexpected.conf" },
+    };
+
+    for (invalid_args) |args| {
+        try expectInvalidArgs(args);
+    }
 }
 
-test "parseArgs invalid args" {
-    const args_missing = [_][]const u8{ "tinyproxy-zig", "-c" };
-    try std.testing.expectError(error.InvalidArgs, parseArgs(&args_missing));
+test "parseArgsDetailed records diagnostics for usage failures" {
+    var detail: ArgsErrorDetail = .{ .illegal_option = '?' };
+    try std.testing.expectError(error.InvalidArgs, parseArgsDetailed(&.{ "tinyproxy", "-c" }, &detail));
+    try std.testing.expectEqual(ArgsErrorDetail{ .missing_argument = 'c' }, detail);
 
-    const args_unknown = [_][]const u8{ "tinyproxy-zig", "--unknown" };
-    try std.testing.expectError(error.InvalidArgs, parseArgs(&args_unknown));
+    detail = .{ .illegal_option = '?' };
+    try std.testing.expectError(error.InvalidArgs, parseArgsDetailed(&.{ "tinyproxy", "-x" }, &detail));
+    try std.testing.expectEqual(ArgsErrorDetail{ .illegal_option = 'x' }, detail);
+    try std.testing.expectEqual(ExitUsage, exitCodeForArgsError(error.InvalidArgs));
 }
