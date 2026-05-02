@@ -1,99 +1,140 @@
 # tinyproxy-zig
 
-A Zig implementation of the [tinyproxy](https://github.com/tinyproxy/tinyproxy) HTTP/HTTPS proxy daemon.
+`tinyproxy-zig` is a Zig implementation of the
+[tinyproxy](https://github.com/tinyproxy/tinyproxy) HTTP/HTTPS proxy daemon.
+It targets behavior compatibility with upstream tinyproxy while using
+[zio](https://github.com/lalinsky/zio) for coroutine-based async I/O.
 
-Built on top of the [zio](https://github.com/lalinsky/zio) coroutine and async I/O framework.
+The project is parity-focused: do not treat it as a new proxy product or a
+place to invent incompatible configuration, protocol, or error behavior.
 
-## Design
+## Status
 
-- **Single-threaded coroutine model**: one coroutine per connection
-- **Async I/O**: zio provides io_uring (Linux), kqueue (macOS), epoll fallback, iocp (Windows)
-- **Feature parity goal**: implement all tinyproxy features in idiomatic Zig
+Current code covers the main tinyproxy feature areas:
 
-## Features
+- HTTP forward proxy and HTTPS `CONNECT`
+- tinyproxy-style configuration parsing
+- ACLs, Basic authentication, anonymous header filtering, and `ConnectPort`
+- request and response header handling, including `Via` and custom headers
+- upstream HTTP, SOCKS4, SOCKS5, and `NoUpstream` routing
+- reverse proxy paths, reverse-only mode, magic cookie support, and base URL rewriting
+- URL/domain filtering, statistics pages, and custom error pages
+- log files, stderr/syslog logging, `SIGUSR1` log reopen, and `SIGHUP` config reload
+- daemon mode, PID files, privilege drop, and graceful shutdown handling
+- Linux transparent proxy support through `SO_ORIGINAL_DST`
 
-### Phase 1: Infrastructure
-- [x] Configuration file parsing (tinyproxy-compatible directives)
-- [x] Logging system (file/stderr/syslog + rotation on SIGUSR1)
+Known constraints:
 
-### Phase 2: Core Proxy
-- [x] Forward proxy (HTTP)
-- [x] HTTPS CONNECT tunnel
-- [x] HTTP header processing (Via, hop-by-hop removal, response headers)
-- [x] Anonymous mode (header whitelist)
-- [x] Custom headers (AddHeader)
+- Zig `0.16.0` is required.
+- The `zio` dependency is expected at `../zio` relative to this repository.
+- Upstream tinyproxy C behavior remains the source of truth for parity work.
+- Prefork directives are accepted for config compatibility but ignored by the
+  single-threaded coroutine runtime.
+- Transparent proxy mode is Linux-only.
+- Production deployment should be validated against the exact target
+  configuration, operating system, and traffic patterns before rollout.
 
-### Phase 3: Access Control
-- [x] ACL (Allow/Deny by IP/subnet)
-- [x] Basic Auth (with BasicAuthRealm)
-- [x] Connect port restriction
-- [x] URL/domain filtering (fnmatch, bre/ere patterns)
+## Build
 
-### Phase 4: Advanced Proxy Modes
-- [x] Upstream proxy (HTTP + SOCKS4/SOCKS5 + NoUpstream)
-- [x] Reverse proxy (ReversePath, ReverseOnly, ReverseMagic, ReverseBaseURL)
-- [x] Transparent proxy (Linux SO_ORIGINAL_DST)
-
-### Phase 5: Production
-- [x] Statistics page (StatHost, StatFile)
-- [x] Signal handling (SIGTERM/SIGINT/SIGUSR1/SIGHUP)
-- [x] Config reload on SIGHUP (runtime settings reload; Listen/Port changes require restart)
-- [x] Daemon mode (daemonize, PID file, privilege drop)
-- [x] Custom error pages (ErrorFile, DefaultErrorFile)
-
-## Quick Start
-
-### Build
-
-```shell
+```sh
 zig build
 ```
 
-### Run
+The executable is installed at:
 
-```shell
-zig build run
+```sh
+zig-out/bin/tinyproxy
 ```
 
-Proxy will listen on `127.0.0.1:9999` (see `src/config.zig`).
+For optimized builds:
 
-### Test
+```sh
+zig build -Doptimize=ReleaseSafe
+```
 
-```shell
-# Run unit tests
+## Run
+
+Run in the foreground with the example configuration:
+
+```sh
+zig build run -- -d -c tinyproxy.conf.example
+```
+
+Or run the installed binary:
+
+```sh
+zig-out/bin/tinyproxy -d -c tinyproxy.conf.example
+```
+
+Without `-d` / `--foreground`, the process daemonizes on Unix-like systems.
+Without `-c`, built-in defaults are used.
+
+Default settings include:
+
+- listen address: wildcard when no `Listen` directive is configured
+- port: `9999`
+- max clients: `100`
+- idle timeout: `600` seconds
+
+## Configuration
+
+Start from `tinyproxy.conf.example`. Supported directive families include:
+
+- network: `Port`, `Listen`, `Bind`, `BindSame`, `Timeout`, `MaxClients`
+- logging: `LogFile`, `Syslog`, `LogLevel`
+- daemon: `User`, `Group`, `PidFile`
+- proxy headers: `ViaProxyName`, `DisableViaHeader`, `XTinyproxy`, `AddHeader`
+- access control: `Allow`, `Deny`, `BasicAuth`, `BasicAuthRealm`
+- policy: `Anonymous`, `ConnectPort`, `Filter`, `FilterType`, `FilterDefaultDeny`
+- routing: `Upstream`, `NoUpstream`, `ReversePath`, `ReverseOnly`,
+  `ReverseMagic`, `ReverseBaseURL`, `Transparent`
+- responses: `StatHost`, `StatFile`, `ErrorFile`, `DefaultErrorFile`
+
+Unknown directives are rejected. Obsolete tinyproxy prefork directives are
+ignored because this implementation uses a single-threaded coroutine model.
+
+## Test
+
+Run the Zig test suite:
+
+```sh
 zig build test
-
-# Test HTTP proxy
-curl -x http://127.0.0.1:9999 http://ipinfo.io/ip
-
-# Test HTTPS tunnel
-curl -x http://127.0.0.1:9999 https://ipinfo.io/ip
-
-# Benchmark
-wrk -c 100 -t 4 http://127.0.0.1:9999
 ```
+
+Basic manual checks:
+
+```sh
+curl -x http://127.0.0.1:9999 http://example.com/
+curl -x http://127.0.0.1:9999 https://example.com/
+```
+
+For proxy behavior changes, compare the result with upstream tinyproxy C and
+cover HTTP, `CONNECT`, config parsing, ACL/auth/filter/upstream/reverse, and
+failure-path cases relevant to the change.
 
 ## Development
 
-See project docs for detailed implementation plans.
+Repository layout:
 
-### Project Structure
-
-```
-src/
-├── main.zig          # Entry point
-├── child.zig         # Connection accept loop
-├── request.zig       # Request handling
-├── relay.zig         # Bidirectional data relay
-├── buffer.zig        # Line reader
-├── config.zig        # Runtime configuration
-└── ...
+```text
+src/main.zig       process entry point and CLI options
+src/conf.zig       tinyproxy-compatible config parser
+src/config.zig     runtime configuration state
+src/child.zig      listener, accept loop, signals, reload, shutdown
+src/request.zig    request processing pipeline
+src/relay.zig      bidirectional relay
+src/upstream.zig   upstream proxy selection
+src/reverse.zig    reverse proxy rewriting
 ```
 
-### Debugging
+Before changing behavior:
 
-Use `mitmproxy` for HTTP layer inspection or `wireshark` for TCP layer.
+1. Inspect the matching upstream C implementation in `../tinyproxy/src/`.
+2. Preserve externally observable tinyproxy semantics unless a difference is
+   explicitly approved and documented.
+3. Add or update focused Zig tests for the changed module.
+4. Run `zig build test`; also run `zig build` when build behavior changes.
 
 ## License
 
-MIT License - Copyright Dacheng Gao
+MIT License.

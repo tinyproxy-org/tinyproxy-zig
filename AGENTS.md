@@ -1,56 +1,60 @@
 # Agent Development Guide
 
-## Project Overview
+## Mission
 
-**tinyproxy-zig** is a Zig implementation of the tinyproxy HTTP/HTTPS proxy, built on top of the zio async I/O framework.
+`tinyproxy-zig` is a production-grade, 1:1 Zig implementation of the original tinyproxy C proxy daemon, built on `zio` async I/O.
 
-### Important: Rewrite Guidelines
+The goal is functional parity, not product reinvention. Every directive, protocol behavior, response, error path, and edge case should match upstream tinyproxy unless a difference is explicitly approved and documented.
 
-This project is a **rewrite of tinyproxy in Zig**. When implementing features:
+## Source of Truth
 
-1. **Maintain Functional Parity**: Keep the same functionality as the original tinyproxy C implementation. Do not add, remove, or change behavior unless explicitly discussed.
+- Upstream behavior: `../tinyproxy/src/`
+- Zig implementation: this repository
+- Async runtime: `../zio`
+- Zig version: `0.16.0`
 
-2. **Idiomatic Zig Implementation**: While functionality must match, the implementation should be native Zig - use Zig idioms, error handling patterns, and standard library conventions rather than direct C-to-Zig translation.
+Before implementing or changing behavior, inspect the corresponding C source and preserve the same externally observable semantics.
 
-3. **Preserve Module Structure**: Keep the same (or similar) module/file structure as the original tinyproxy. Each C source file should have a corresponding Zig module with equivalent responsibilities.
+## Non-Negotiables
 
-**Reference**: Always consult `../../tinyproxy/src/` for the original C implementation when implementing new features or debugging behavior differences.
+- Keep feature parity with tinyproxy C: do not add, remove, rename, or reinterpret behavior without explicit approval.
+- Use idiomatic Zig: standard library conventions, explicit error unions, optionals, `defer`/`errdefer`, allocator ownership, and clear lifetimes.
+- Use `zio` for async networking and coroutine orchestration; do not introduce a competing I/O model.
+- Preserve the original module responsibilities where practical: each tinyproxy C source area should map to a clear Zig module.
+- Keep changes small and local. Avoid broad rewrites, speculative abstractions, or cleanup unrelated to the requested behavior.
+- Treat production safety as required: bounded parsing, deterministic cleanup, useful errors/logs, no leaks, no hidden global mutable state.
 
-## Tech Stack
+## Implementation Standards
 
-- **Language**: Zig 0.16.0
-- **Async Runtime**: zio (stackful coroutines + io_uring/kqueue/epoll)
-- **Reference**: tinyproxy (C version) - functionality parity goal
+- Prefer explicit state, dependency injection, and owned data over global mutable state.
+- Validate all external input: config, HTTP syntax, headers, addresses, ports, paths, credentials, and upstream responses.
+- Make resource ownership obvious for sockets, buffers, files, allocators, timers, and coroutine state.
+- Hot paths must avoid avoidable allocation, copying, formatting, repeated parsing, and O(n^2) scans.
+- Keep CPU and memory behavior predictable under many concurrent connections, slow clients, large headers, and relay backpressure.
+- Use `std.log.scoped` for module logs; keep structured details useful for operations without exposing secrets.
+- Public APIs should have concise `///` comments when they are part of a module contract.
 
-## Code Style
+## Verification
 
-- Follow Zig standard library conventions strictly
-- Use `error union` and `optional` for error handling
-- Avoid global mutable state (use dependency injection)
-- Naming: `snake_case` for functions/variables, `PascalCase` for types
-- Documentation: use `///` doc comments for public APIs
+For every behavior change:
 
-## Architecture
+- Compare against upstream tinyproxy C behavior before coding.
+- Add or update focused Zig tests for the changed module.
+- Run `zig build test`; run `zig build` when build behavior or dependencies changed.
+- For proxy behavior, verify with representative HTTP, HTTPS CONNECT, config, ACL/auth/filter/upstream/reverse, and failure-path cases as applicable.
+- For performance-sensitive paths, check allocation count, unnecessary copies, relay throughput, and memory growth before claiming improvement.
 
-- **Single-threaded coroutine model**: one coroutine per connection
-- **Modular design**: each feature is a separate `.zig` file
-- **Configuration-driven**: all features controllable via config file
+Do not claim parity, production readiness, performance improvement, or test success without fresh evidence from the current workspace.
 
-## Common Tasks
+## Common Workflow
 
-### Adding a new feature
+- New feature parity work: inspect upstream C, implement the matching Zig module behavior, integrate config/request flow, update README checklist if needed.
+- Bug or mismatch: reproduce the Zig behavior, compare with upstream C, fix the smallest responsible module, add regression coverage.
+- Refactor: preserve observable behavior exactly and prove it with existing or added tests.
 
-1. Create `src/<feature>.zig`
-2. Add config options to `conf.zig`
-3. Integrate into `request.zig` processing pipeline
-4. Update README.md feature checklist
+## Project Shape
 
-### Debugging
-
-- Use `std.log.scoped` for module-specific logging
-- Enable debug allocator in `main.zig`
-
-## Reference Repositories
-
-- **tinyproxy (C)**: `../../tinyproxy` - functionality reference
-- **zio**: `../../dacheng-zig/zio` - async I/O library
+- `src/conf.zig` / `src/config.zig`: tinyproxy-compatible configuration parsing and runtime config.
+- `src/request.zig`: request processing pipeline.
+- `src/relay.zig`: bidirectional proxy relay and backpressure-sensitive data flow.
+- `src/<feature>.zig`: focused modules matching tinyproxy feature areas.
