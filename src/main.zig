@@ -10,6 +10,8 @@ const logger = @import("log.zig");
 const signals = @import("signals.zig");
 const stats = @import("stats.zig");
 
+const log = std.log.scoped(.main);
+
 const DefaultConfigPath = "";
 
 const ArgsError = error{InvalidArgs};
@@ -77,11 +79,17 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
+    if (cli.config_path.len == 0) {
+        log.info("using built-in default configuration", .{});
+    } else {
+        log.info("loading configuration from '{s}'", .{cli.config_path});
+    }
+
     var conf = if (cli.config_path.len == 0)
         Config.init(allocator)
     else
         conf_parser.parseFile(io, allocator, cli.config_path) catch |err| {
-            std.debug.print("Failed to load config '{s}': {}\n", .{ cli.config_path, err });
+            log.err("failed to load config '{s}': {}", .{ cli.config_path, err });
             return err;
         };
     defer conf.deinit();
@@ -89,21 +97,27 @@ pub fn main(init: std.process.Init) !void {
     // Daemonize if not running in foreground mode
     if (!cli.foreground) {
         daemon.daemonize() catch |err| {
-            std.debug.print("Failed to daemonize: {}\n", .{err});
+            log.err("failed to daemonize: {}", .{err});
             return err;
         };
+        log.info("daemonized process", .{});
+    } else {
+        log.info("running in foreground", .{});
     }
 
     // Write PID file if configured
     if (conf.pid_file) |pid_path| {
         daemon.writePidFile(io, pid_path) catch |err| {
-            std.debug.print("Failed to write PID file: {}\n", .{err});
+            log.err("failed to write PID file '{s}': {}", .{ pid_path, err });
             return err;
         };
+        log.info("wrote PID file '{s}'", .{pid_path});
     }
 
     try logger.init(io, &conf);
     defer logger.deinit();
+    const log_backend = if (conf.use_syslog) "syslog" else if (conf.log_file != null) "file" else "stderr";
+    log.info("logging initialized backend={s} level={s}", .{ log_backend, @tagName(conf.log_level) });
 
     // Initialize statistics start time
     stats.global.initStartTime();
@@ -127,13 +141,12 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn main_task(rt: *zio.Runtime, io: std.Io, conf: *Config, config_path: []const u8) !void {
-    const log_main = std.log.scoped(.main_task);
-    log_main.info("starting", .{});
+    log.info("starting", .{});
     try child.listen_socket(rt, conf);
     defer child.close_listen_sockets();
-    log_main.info("listen_socket returned, calling main_loop", .{});
+    log.debug("listeners initialized, entering main loop", .{});
     try child.main_loop(rt, io, conf, config_path);
-    log_main.info("main_loop returned", .{});
+    log.info("main loop returned", .{});
 }
 
 test "parseArgs default path" {

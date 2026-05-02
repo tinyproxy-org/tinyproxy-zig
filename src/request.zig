@@ -16,7 +16,7 @@ const stats = @import("stats.zig");
 const transparent = @import("transparent.zig");
 const upstream_mod = @import("upstream.zig");
 
-const log = std.log.scoped(.@"tinyproxy/request");
+const log = std.log.scoped(.request);
 
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
@@ -189,6 +189,8 @@ fn checkAuthentication(stream: *zio.net.Stream, config: *const Config, message: 
     const selected = selectAuthHeader(config, message);
     if (config.auth.verify(selected.header)) return true;
 
+    log.info("authentication failed client={f} challenge={s}", .{ stream.socket.address.ip, @tagName(selected.challenge) });
+
     const auth_mod = @import("auth.zig");
     var response_buf: [512]u8 = undefined;
     const response = switch (selected.challenge) {
@@ -219,6 +221,7 @@ fn parseRequestWithTransparentFallback(
             // Try to get original destination from intercepted connection
             if (transparent.getOriginalDest(socket_handle, &transparent_buf)) |dest| {
                 const parsed = http.parse_request_line(req_line) catch return err;
+                log.debug("transparent destination resolved target={s}:{d}", .{ dest.host, dest.port });
                 const req_obj = rt.allocator.create(Request) catch return err;
                 req_obj.* = .{
                     .method = rt.allocator.dupe(u8, parsed.method) catch return err,
@@ -256,6 +259,7 @@ fn applyReverseProxy(
     if (config.reverse.rewriteWithMagic(req.path, cookie_header)) |magic_result| {
         const rw = magic_result.result;
         const path_prefix = magic_result.path_prefix;
+        log.debug("reverse proxy matched prefix={s} target={s}:{d} path={s}", .{ path_prefix, rw.host, rw.port, logPath(req.path) });
         // Rewrite the request for reverse proxy
         rt.allocator.free(req.host);
         req.host = try rt.allocator.dupe(u8, rw.host);
@@ -265,6 +269,7 @@ fn applyReverseProxy(
         return .{ .is_reverse = true, .path_prefix = path_prefix };
     } else if (config.reverse.reverse_only) {
         // ReverseOnly mode: reject requests that don't match any mapping
+        log.info("reverse-only rejected host={s} path={s}", .{ req.host, logPath(req.path) });
         try stream.writeAll(ERROR_403_REVERSE_ONLY, .none);
         return RequestError.ReverseOnlyDenied;
     }
@@ -282,6 +287,7 @@ fn handleConnect(
 ) !void {
     const check = connect_ports.checkConnectPort(config, req.port);
     if (check == .denied) {
+        log.info("CONNECT rejected by port policy host={s} port={d}", .{ req.host, req.port });
         try stream.writeAll(ERROR_403_CONNECT, .none);
         return;
     }
@@ -295,6 +301,7 @@ fn handleConnect(
     }
 
     try stream.writeAll("HTTP/1.1 200 Connection established\r\nProxy-agent: tinyproxy\r\n\r\n", .none);
+    log.debug("CONNECT tunnel established host={s} port={d}", .{ req.host, req.port });
     _ = try reader.flush_to(rt, &upstream);
     try relay.copy_bidi(rt, stream.*, upstream);
 }
@@ -427,7 +434,8 @@ fn applyUpstreamProxy(
             req.path = abs_url;
         },
         .socks4, .socks5 => {
-            socks.connect(rt, upstream, proxy.proxy_type, proxy.user, proxy.pass, req.host, req.port) catch {
+            socks.connect(rt, upstream, proxy.proxy_type, proxy.user, proxy.pass, req.host, req.port) catch |err| {
+                log.warn("SOCKS upstream handshake failed type={s} target={s}:{d}: {}", .{ @tagName(proxy.proxy_type), req.host, req.port, err });
                 try stream.writeAll(ERROR_502, .none);
                 return RequestError.SocksHandshakeFailed;
             };
@@ -482,6 +490,7 @@ pub fn handle_connection(rt: *zio.Runtime, io: std.Io, client: zio.net.Stream, c
     // Check if this is a stats page request
     if (config.stat_host) |stat_host| {
         if (std.ascii.eqlIgnoreCase(req.host, stat_host)) {
+            log.info("serving stats page client={f} host={s}", .{ stream.socket.address.ip, req.host });
             try sendStatsResponse(rt, io, &stream, config);
             return;
         }
@@ -493,6 +502,7 @@ pub fn handle_connection(rt: *zio.Runtime, io: std.Io, client: zio.net.Stream, c
         defer rt.allocator.free(filter_url);
 
         if (config.isFiltered(filter_url)) {
+            log.info("filter blocked request client={f} method={s} host={s} path={s}", .{ stream.socket.address.ip, req.method, req.host, logPath(req.path) });
             try stream.writeAll(ERROR_403_FILTERED, .none);
             return;
         }
@@ -723,6 +733,12 @@ fn containsHttpUnsafe(s: []const u8) bool {
     return std.mem.indexOfAny(u8, s, "\r\n\x00") != null;
 }
 
+fn logPath(path: []const u8) []const u8 {
+    const query = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
+    const fragment = std.mem.indexOfScalar(u8, path, '#') orelse path.len;
+    return path[0..@min(query, fragment)];
+}
+
 fn extract_url(allocator: std.mem.Allocator, url: []const u8, default_port: u16, req: *Request) !void {
     const slash_pos = std.mem.indexOf(u8, url, "/");
 
@@ -947,6 +963,12 @@ test "selectAuthHeader keeps proxy challenge when proxy header exists on stat ho
     try std.testing.expectEqualStrings("Basic bad", selected.header.?);
 }
 
+test "logPath redacts query and fragment" {
+    try std.testing.expectEqualStrings("/search", logPath("/search?q=secret#part"));
+    try std.testing.expectEqualStrings("/docs", logPath("/docs#token"));
+    try std.testing.expectEqualStrings("/", logPath("/"));
+}
+
 fn connectTarget(rt: *zio.Runtime, req: *const Request, config: *const Config, client_socket: std.posix.socket_t) !struct { stream: zio.net.Stream, proxy: ?*const upstream_mod.UpstreamProxy } {
     const proxy = if (config.upstream_initialized) config.upstream.findUpstream(req.host) else null;
 
@@ -962,16 +984,22 @@ fn connectTarget(rt: *zio.Runtime, req: *const Request, config: *const Config, c
             .address => |resolved| break :blk resolved,
             .canonical_name => {},
         };
+        log.warn("DNS lookup failed host={s} port={d}", .{ target_host, target_port });
         return error.UnknownHostName;
     };
 
     // Determine bind behavior: BindSame takes precedence over Bind directives.
     var local_addr_buf: [64]u8 = undefined;
-    const stream = if (config.bind_same)
-        try socket.connectWithBind(rt, addr, socket.get_local_addr_str(client_socket, &local_addr_buf) orelse return error.AddressNotAvailable)
+    const route = if (proxy) |p| @tagName(p.proxy_type) else "direct";
+    log.debug("connecting route={s} target={s}:{d} request_host={s}:{d}", .{ route, target_host, target_port, req.host, req.port });
+    const stream = (if (config.bind_same)
+        socket.connectWithBind(rt, addr, socket.get_local_addr_str(client_socket, &local_addr_buf) orelse return error.AddressNotAvailable)
     else if (config.bind_addrs.items.len > 0)
-        try socket.connectWithBindList(rt, addr, config.bind_addrs.items)
+        socket.connectWithBindList(rt, addr, config.bind_addrs.items)
     else
-        try socket.connectWithBind(rt, addr, null);
+        socket.connectWithBind(rt, addr, null)) catch |err| {
+        log.warn("connect failed route={s} target={s}:{d}: {}", .{ route, target_host, target_port, err });
+        return err;
+    };
     return .{ .stream = stream, .proxy = proxy };
 }

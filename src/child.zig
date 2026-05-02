@@ -10,7 +10,7 @@ const request = @import("request.zig");
 const socket = @import("socket.zig");
 const stats = @import("stats.zig");
 
-const log = std.log.scoped(.@"tinyproxy/child");
+const log = std.log.scoped(.child);
 
 /// Error response for denied connections
 const ERROR_403_DENIED = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nAccess denied by ACL";
@@ -281,8 +281,16 @@ fn handleConnectionWithCounter(rt: *zio.Runtime, io: std.Io, stream: zio.net.Str
         stats.global.recordClose();
     }
     request.handle_connection(rt, io, stream, config) catch |err| {
+        if (isExpectedConnectionClose(err)) {
+            log.debug("Connection closed: {}", .{err});
+            return;
+        }
         log.err("Connection handler error: {}", .{err});
     };
+}
+
+fn isExpectedConnectionClose(err: anyerror) bool {
+    return err == error.EndOfStream;
 }
 
 pub fn accept_once(_: *zio.Runtime) !void {
@@ -320,4 +328,9 @@ test "accepts one connection" {
     stream.close();
 
     try server_task.join();
+}
+
+test "connection handler treats EOF as normal close" {
+    try std.testing.expect(isExpectedConnectionClose(error.EndOfStream));
+    try std.testing.expect(!isExpectedConnectionClose(error.BadRequest));
 }

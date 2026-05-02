@@ -22,6 +22,8 @@ const FilterMode = @import("filter.zig").FilterMode;
 const FilterTarget = @import("filter.zig").FilterTarget;
 const FilterType = @import("filter.zig").FilterType;
 
+const log = std.log.scoped(.conf);
+
 /// Configuration parsing errors
 pub const ParseError = error{
     InvalidPort,
@@ -178,16 +180,19 @@ pub const Directive = enum {
 
 /// Parse a configuration file from disk
 pub fn parseFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Config {
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+        log.warn("failed to open config '{s}': {}", .{ path, err });
+        return err;
+    };
     defer file.close(io);
 
     const stat = file.stat(io) catch |err| {
-        std.debug.print("Failed to stat config '{s}': {}\n", .{ path, err });
+        log.warn("failed to stat config '{s}': {}", .{ path, err });
         return err;
     };
     const max_size = 1024 * 1024; // 1MB max
     if (stat.size > max_size) {
-        std.debug.print("Config file '{s}' too large ({d} > {d} bytes). Consider splitting into multiple files.\n", .{ path, stat.size, max_size });
+        log.warn("config file '{s}' too large ({d} > {d} bytes)", .{ path, stat.size, max_size });
         return error.ConfigFileTooLarge;
     }
 
@@ -195,7 +200,13 @@ pub fn parseFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Co
     const content = try reader.interface.allocRemaining(allocator, .limited(max_size));
     defer allocator.free(content);
 
-    return parseTextWithIo(io, allocator, content);
+    const config = parseTextWithIo(io, allocator, content) catch |err| {
+        log.warn("failed to parse config '{s}': {}", .{ path, err });
+        return err;
+    };
+
+    log.info("loaded config '{s}' ({d} bytes)", .{ path, stat.size });
+    return config;
 }
 
 /// Reload an existing config from disk, replacing it on success.
@@ -361,7 +372,7 @@ fn parseLine(io: std.Io, allocator: std.mem.Allocator, config: *Config, line: []
             config.acl.allow(value) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
-                    std.log.warn("Ignoring invalid Allow rule: {s}", .{value});
+                    log.warn("ignoring invalid Allow rule: {s}", .{value});
                 },
             };
         },
@@ -370,7 +381,7 @@ fn parseLine(io: std.Io, allocator: std.mem.Allocator, config: *Config, line: []
             config.acl.deny(value) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
-                    std.log.warn("Ignoring invalid Deny rule: {s}", .{value});
+                    log.warn("ignoring invalid Deny rule: {s}", .{value});
                 },
             };
         },
@@ -552,7 +563,7 @@ fn parseLine(io: std.Io, allocator: std.mem.Allocator, config: *Config, line: []
         // These are ignored but should log a warning in production
         .max_spare_servers, .min_spare_servers, .start_servers, .max_requests_per_child => {
             // Prefork directives not applicable to single-threaded coroutine model
-            std.log.warn("Ignoring obsolete/prefork directive in single-threaded mode", .{});
+            log.warn("ignoring obsolete/prefork directive in single-threaded mode", .{});
         },
 
         .unknown => {
@@ -1062,6 +1073,10 @@ test "reload config applies new values" {
 
 test "reload config keeps previous values on error" {
     const allocator = std.testing.allocator;
+    const original_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = original_log_level;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
