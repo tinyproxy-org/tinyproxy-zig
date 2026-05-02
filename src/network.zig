@@ -1,17 +1,10 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
-const native_os = builtin.os.tag;
-
-const darwin = @import("darwin.zig");
 
 const SEGMENT_LEN = 512;
 const MAXIMUM_BUFFER_LENGTH = 128 * 1024;
 
-const MSG = switch (native_os) {
-    .ios, .macos, .tvos, .visionos, .watchos => darwin.MSG,
-    else => posix.MSG,
-};
+const MSG = posix.MSG;
 
 const ReadLines = struct {
     data: []u8,
