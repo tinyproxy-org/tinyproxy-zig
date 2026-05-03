@@ -109,7 +109,7 @@ LogLevel Info
 # Transparent Yes
 
 # =========================================================================
-# Upstream Proxy (Phase 4.1)
+# Upstream Proxy
 # =========================================================================
 #
 # Configure upstream proxies

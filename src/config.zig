@@ -64,7 +64,7 @@ pub const Config = struct {
     idle_timeout: u32 = 600, // 10 minutes
 
     // ========================================================================
-    // Via Header (Phase 2.2)
+    // Via Header
     // ========================================================================
     /// Custom proxy name for Via header (default: "tinyproxy")
     via_proxy_name: ?[]const u8 = null,
@@ -75,7 +75,7 @@ pub const Config = struct {
     xtinyproxy: bool = false,
 
     // ========================================================================
-    // Anonymous Mode (Phase 2.3)
+    // Anonymous Mode
     // ========================================================================
     /// Enable anonymous mode (filter client headers)
     anonymous_enabled: bool = false,
@@ -84,20 +84,20 @@ pub const Config = struct {
     anonymous_headers_initialized: bool = false,
 
     // ========================================================================
-    // CONNECT Port Restrictions (Phase 3.3)
+    // CONNECT Port Restrictions
     // ========================================================================
     /// Allowed ports for CONNECT method (empty = all allowed)
     connect_ports: std.ArrayList(PortRange) = undefined,
     connect_ports_initialized: bool = false,
 
     // ========================================================================
-    // AddHeader (Phase 2.2.4)
+    // AddHeader
     // ========================================================================
     add_headers: std.ArrayList(AddHeader) = undefined,
     add_headers_initialized: bool = false,
 
     // ========================================================================
-    // Logging (Phase 1.2 - skeleton)
+    // Logging
     // ========================================================================
     log_file: ?[]const u8 = null,
     log_file_owned: bool = false,
@@ -105,7 +105,7 @@ pub const Config = struct {
     use_syslog: bool = false,
 
     // ========================================================================
-    // Daemon Mode (Phase 5.3 - skeleton)
+    // Daemon Mode
     // ========================================================================
     user: ?[]const u8 = null,
     user_owned: bool = false,
@@ -115,25 +115,25 @@ pub const Config = struct {
     pid_file_owned: bool = false,
 
     // ========================================================================
-    // ACL Access Control (Phase 3.1)
+    // ACL Access Control
     // ========================================================================
     acl: Acl = undefined,
     acl_initialized: bool = false,
 
     // ========================================================================
-    // Basic Auth (Phase 3.2)
+    // Basic Auth
     // ========================================================================
     auth: BasicAuth = undefined,
     auth_initialized: bool = false,
 
     // ========================================================================
-    // Upstream Proxy (Phase 4.1)
+    // Upstream Proxy
     // ========================================================================
     upstream: UpstreamManager = undefined,
     upstream_initialized: bool = false,
 
     // ========================================================================
-    // URL/Domain Filter (Phase 3.4)
+    // URL/Domain Filter
     // ========================================================================
     filter: Filter = undefined,
     filter_initialized: bool = false,
@@ -142,7 +142,7 @@ pub const Config = struct {
     filter_file_owned: bool = false,
 
     // ========================================================================
-    // Statistics Page (Phase 5.1)
+    // Statistics Page
     // ========================================================================
     /// Host name for stats page (e.g., "tinyproxy.stats")
     stat_host: ?[]const u8 = null,
@@ -152,7 +152,7 @@ pub const Config = struct {
     stat_file_owned: bool = false,
 
     // ========================================================================
-    // Error Pages (Phase 5.4)
+    // Error Pages
     // ========================================================================
     /// Default error page template file
     default_error_file: ?[]const u8 = null,
@@ -162,13 +162,13 @@ pub const Config = struct {
     error_files_initialized: bool = false,
 
     // ========================================================================
-    // Reverse Proxy (Phase 4.2)
+    // Reverse Proxy
     // ========================================================================
     reverse: ReverseProxy = undefined,
     reverse_initialized: bool = false,
 
     // ========================================================================
-    // Transparent Proxy (Phase 4.3)
+    // Transparent Proxy
     // ========================================================================
     /// Enable transparent proxy mode (use SO_ORIGINAL_DST)
     transparent: bool = false,

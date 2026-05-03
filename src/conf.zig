@@ -393,7 +393,7 @@ fn parseLine(io: std.Io, allocator: std.mem.Allocator, config: *Config, line: []
             config.auth.addUser(user, pass) catch return error.OutOfMemory;
         },
 
-        // Directives that need future phases (store raw for now)
+        // Upstream proxy directives
         .upstream => {
             config.upstream.addUpstream(rest) catch |err| {
                 return switch (err) {
