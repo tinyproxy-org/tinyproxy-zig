@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const build_options = @import("build_options");
 const zio = @import("zio");
@@ -114,18 +115,26 @@ fn exitCodeForArgsError(err: ArgsError) u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    // Use DebugAllocator in development builds for leak detection
-    var gpa = std.heap.DebugAllocator(.{
-        .safety = true,
-    }).init;
-    defer {
-        const leaked = gpa.deinit();
-        if (leaked == .leak) {
-            std.log.err("Memory leaks detected!", .{});
-        }
+    switch (builtin.mode) {
+        .Debug => {
+            // Use DebugAllocator in development builds for leak detection.
+            var gpa = std.heap.DebugAllocator(.{
+                .safety = true,
+            }).init;
+            defer {
+                const leaked = gpa.deinit();
+                if (leaked == .leak) {
+                    std.log.err("Memory leaks detected!", .{});
+                }
+            }
+            return runMain(init, gpa.allocator());
+        },
+        .ReleaseFast, .ReleaseSafe, .ReleaseSmall => return runMain(init, std.heap.smp_allocator),
     }
-    const allocator = gpa.allocator();
+}
+
+fn runMain(init: std.process.Init, allocator: std.mem.Allocator) !void {
+    const io = init.io;
 
     var args_arena = std.heap.ArenaAllocator.init(allocator);
     defer args_arena.deinit();
