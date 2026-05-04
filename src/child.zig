@@ -27,6 +27,20 @@ fn listeningPort(server: zio.net.Server) u16 {
     return server.socket.address.ip.getPort();
 }
 
+fn formatListenEndpoint(buf: []u8, host: []const u8, port: u16) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, host, ':') != null) {
+        return std.fmt.bufPrint(buf, "[{s}]:{d}", .{ host, port });
+    }
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ host, port });
+}
+
+test "formats IPv6 listen endpoint with brackets" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("[::]:60080", try formatListenEndpoint(&buf, "::", 60080));
+    try std.testing.expectEqualStrings("[::1]:60080", try formatListenEndpoint(&buf, "::1", 60080));
+    try std.testing.expectEqualStrings("127.0.0.1:60080", try formatListenEndpoint(&buf, "127.0.0.1", 60080));
+}
+
 pub fn listen_socket(_: *zio.Runtime, config: *Config) !void {
     // Reset previous listeners if needed (defensive in tests/restarts).
     close_listen_sockets();
@@ -62,7 +76,9 @@ pub fn listen_socket(_: *zio.Runtime, config: *Config) !void {
             const ip = try zio.net.IpAddress.parseIp(listen_addr, config.port);
             const server = try ip.listen(.{ .kernel_backlog = 1024, .reuse_address = true });
             try listen_servers.append(config.allocator, server);
-            log.info("listening on {s}:{d}", .{ listen_addr, listeningPort(server) });
+            var endpoint_buf: [128]u8 = undefined;
+            const endpoint = try formatListenEndpoint(&endpoint_buf, listen_addr, listeningPort(server));
+            log.info("listening on {s}", .{endpoint});
         }
     }
 
