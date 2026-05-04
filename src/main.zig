@@ -168,9 +168,6 @@ pub fn main(init: std.process.Init) !void {
             log.err("failed to daemonize: {}", .{err});
             return err;
         };
-        log.info("daemonized process", .{});
-    } else {
-        log.info("running in foreground", .{});
     }
 
     // Write PID file if configured
@@ -209,12 +206,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn main_task(rt: *zio.Runtime, io: std.Io, conf: *Config, config_path: []const u8) !void {
-    log.info("starting", .{});
     try child.listen_socket(rt, conf);
     defer child.close_listen_sockets();
-    log.debug("listeners initialized, entering main loop", .{});
     try child.main_loop(rt, io, conf, config_path);
-    log.info("main loop returned", .{});
 }
 
 const ExpectedCliOptions = struct {

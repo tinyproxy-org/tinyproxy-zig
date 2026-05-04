@@ -147,7 +147,6 @@ fn rotateLogFile(io: std.Io, config: *const Config) void {
 }
 
 pub fn main_loop(rt: *zio.Runtime, io: std.Io, config: *Config, config_path: []const u8) !void {
-    log.info("main_loop: starting main loop", .{});
     if (listen_servers.items.len == 0) return error.NotListening;
     shutting_down.store(false, .release);
 

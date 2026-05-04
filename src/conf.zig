@@ -205,7 +205,6 @@ pub fn parseFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Co
         return err;
     };
 
-    log.info("loaded config '{s}' ({d} bytes)", .{ path, stat.size });
     return config;
 }
 
