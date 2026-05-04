@@ -23,6 +23,10 @@ var listen_servers_allocator: ?std.mem.Allocator = null;
 var active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
+fn listeningPort(server: zio.net.Server) u16 {
+    return server.socket.address.ip.getPort();
+}
+
 pub fn listen_socket(_: *zio.Runtime, config: *Config) !void {
     // Reset previous listeners if needed (defensive in tests/restarts).
     close_listen_sockets();
@@ -38,7 +42,7 @@ pub fn listen_socket(_: *zio.Runtime, config: *Config) !void {
         if (any_v4.listen(.{ .kernel_backlog = 1024, .reuse_address = true })) |server| {
             try listen_servers.append(config.allocator, server);
             bound_any = true;
-            log.info("listening on 0.0.0.0:{d}", .{config.port});
+            log.info("listening on 0.0.0.0:{d}", .{listeningPort(server)});
         } else |err| {
             log.warn("Failed to listen on 0.0.0.0:{d}: {}", .{ config.port, err });
         }
@@ -47,7 +51,7 @@ pub fn listen_socket(_: *zio.Runtime, config: *Config) !void {
         if (any_v6.listen(.{ .kernel_backlog = 1024, .reuse_address = true })) |server| {
             try listen_servers.append(config.allocator, server);
             bound_any = true;
-            log.info("listening on [::]:{d}", .{config.port});
+            log.info("listening on [::]:{d}", .{listeningPort(server)});
         } else |err| {
             log.warn("Failed to listen on [::]:{d}: {}", .{ config.port, err });
         }
@@ -58,7 +62,7 @@ pub fn listen_socket(_: *zio.Runtime, config: *Config) !void {
             const ip = try zio.net.IpAddress.parseIp(listen_addr, config.port);
             const server = try ip.listen(.{ .kernel_backlog = 1024, .reuse_address = true });
             try listen_servers.append(config.allocator, server);
-            log.info("listening on {s}:{d}", .{ listen_addr, config.port });
+            log.info("listening on {s}:{d}", .{ listen_addr, listeningPort(server) });
         }
     }
 
@@ -328,6 +332,26 @@ test "accepts one connection" {
     stream.close();
 
     try server_task.join();
+}
+
+test "logs actual assigned port when configured port is zero" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    const rt = try zio.Runtime.init(gpa.allocator(), .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    var test_config = Config.init(gpa.allocator());
+    try test_config.addListenAddress("127.0.0.1");
+    test_config.port = 0;
+    defer test_config.deinit();
+
+    try listen_socket(rt, &test_config);
+    defer close_listen_sockets();
+
+    const actual_port = listen_servers.items[0].socket.address.ip.getPort();
+    try std.testing.expect(actual_port != 0);
+    try std.testing.expectEqual(actual_port, listeningPort(listen_servers.items[0]));
+    try std.testing.expect(listeningPort(listen_servers.items[0]) != test_config.port);
 }
 
 test "connection handler treats EOF as normal close" {
